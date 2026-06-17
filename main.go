@@ -30,9 +30,11 @@ func main() {
 	defer closeLog()
 
 	// Supprimer les logs internes de pion/WebRTC (très verbeux).
+	// log.SetOutput(io.Discard) coupe le logger standard pour toute la durée du processus.
+	// NE PAS restaurer avec log.SetOutput(os.Stdout) : pion/ICE utilise log.Printf
+	// pour ses messages "Failed to send packet" et "ICE connection state changed".
 	log.SetOutput(io.Discard)
 	lkprotoLogger.SetLogger(nullLogger{}, "racecast-receiver")
-	log.SetOutput(os.Stdout)
 
 	if cfg.LiveKit.Domain == "" {
 		logger.Fatal("RC_LIVEKIT_DOMAIN non défini")
