@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"strconv"
-	"strings"
 )
 
 // Config contient toute la configuration du receiver chargée depuis les variables d'environnement.
@@ -43,19 +42,16 @@ func (c LiveKitConfig) APIURL() string {
 
 // SRTConfig décrit les paramètres d'écoute SRT.
 //
-// RC_SRT_PORTS="9000-9010" ouvre un listener par port dans la plage.
-// Chaque port accepte n'importe quel type de flux (vidéo AV1, audio Opus,
-// ou autre à l'avenir). Le type est déterminé dynamiquement au moment de la
-// connexion via le paramètre SRT streamid ("name:source") envoyé par la Jetson.
+// Un seul port SRT est utilisé pour toutes les connexions entrantes.
+// Le type de flux (vidéo AV1, audio Opus, etc.) est déterminé dynamiquement
+// depuis le paramètre SRT streamid ("name:source") envoyé par la Jetson.
 type SRTConfig struct {
-	PortStart int // RC_SRT_PORTS : borne inférieure (incluse)
-	PortEnd   int // RC_SRT_PORTS : borne supérieure (incluse)
-	Latency   int // RC_SRT_LATENCY en ms (défaut 2000)
+	Port    int // RC_SRT_PORT : port d'écoute
+	Latency int // RC_SRT_LATENCY en ms (défaut 2000)
 }
 
 // Load lit la configuration depuis les variables d'environnement.
 func Load() Config {
-	start, end := parseSRTPorts()
 	return Config{
 		LiveKit: LiveKitConfig{
 			TLS:       getEnv("RC_LIVEKIT_TLS", "true") != "false",
@@ -66,32 +62,18 @@ func Load() Config {
 			Identity:  getEnv("RC_LIVEKIT_IDENTITY", "racecast-receiver"),
 		},
 		SRT: SRTConfig{
-			PortStart: start,
-			PortEnd:   end,
-			Latency:   getEnvInt("RC_SRT_LATENCY", 2000),
+			Port:    parseSRTPort(),
+			Latency: getEnvInt("RC_SRT_LATENCY", 2000),
 		},
 	}
 }
 
-// parseSRTPorts analyse RC_SRT_PORTS="start-end" et retourne (start, end).
-// Un port unique "9000" est accepté (start == end).
-func parseSRTPorts() (start, end int) {
-	v := os.Getenv("RC_SRT_PORTS")
-	if v == "" {
-		return 9000, 9007 // défaut : 8 ports
+// parseSRTPort lit RC_SRT_PORT et retourne le port configuré (défaut 9000).
+func parseSRTPort() int {
+	if n, err := strconv.Atoi(os.Getenv("RC_SRT_PORT")); err == nil && n > 0 {
+		return n
 	}
-	if i := strings.Index(v, "-"); i >= 0 {
-		s, err1 := strconv.Atoi(strings.TrimSpace(v[:i]))
-		e, err2 := strconv.Atoi(strings.TrimSpace(v[i+1:]))
-		if err1 == nil && err2 == nil && s > 0 && e >= s {
-			return s, e
-		}
-	}
-	// Port unique
-	if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n > 0 {
-		return n, n
-	}
-	return 9000, 9007
+	return 9000
 }
 
 func getEnv(key, def string) string {

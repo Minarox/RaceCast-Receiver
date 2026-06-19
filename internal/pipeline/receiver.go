@@ -1,27 +1,22 @@
 package pipeline
 
-// receiver.go orchestre les listeners SRT et la publication dans LiveKit.
+// receiver.go orchestre le listener SRT unique et la publication dans LiveKit.
 //
-// Architecture en deux phases par port :
-//  1. Probe  : pipeline léger "srtsrc ! fakesink" — lie le port SRT et attend
-//              la connexion de la Jetson. Le signal caller-added fournit le
-//              streamid au format "name:source" (ex : "Route:camera").
-//              Le probe s'arrête dès le premier caller-added.
-//  2. Stream : pipeline typé (av1parse ou queue) créé selon la source détectée.
-//              La Jetson se reconnecte automatiquement (mode caller SRT).
-//              Le track LiveKit est publié à la deuxième connexion, puis retiré
-//              à la déconnexion. Le cycle recommence indéfiniment.
-//
-// Tous les ports de la plage RC_SRT_PORTS sont homogènes : le type (vidéo, audio,
-// ou tout futur format) est découvert dynamiquement depuis le streamid SRT.
-// Aucune configuration par flux n'est nécessaire côté receiver.
+// Architecture port unique :
+//   - Un seul socket SRT en écoute sur cfg.SRT.Port.
+//   - Chaque connexion entrante retourne son streamid ("name:source") pendant
+//     le handshake SRT — le type de flux est connu immédiatement.
+//   - Goroutine par connexion : SRT recv → appsrc → pipeline GStreamer → appsink
+//     → WriteSample LiveKit. Pas de phase probe, pas de reconnexion attendue.
+//   - La Jetson envoie ses streams en mode caller sur le même port ; la
+//     discrimination se fait uniquement par streamid.
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
-	"time"
 
 	lkproto "github.com/livekit/protocol/livekit"
 	lksdk "github.com/livekit/server-sdk-go/v2"
@@ -32,225 +27,247 @@ import (
 	"racecast-receiver/internal/logger"
 )
 
-// srtListenerURI construit l'URI SRT pour un listener dual-stack (IPv4 + IPv6) sur le port donné.
-// Sur Linux, lier à [::] avec IPV6_V6ONLY=0 (valeur système par défaut) crée un socket
-// dual-stack qui accepte à la fois les connexions IPv4 et IPv6.
-func srtListenerURI(port, latency int) string {
-	return fmt.Sprintf("srt://[::]:%d?mode=listener&latency=%d", port, latency)
-}
-
-// buildProbePipeline construit le pipeline GStreamer minimal pour détecter le
-// streamid SRT d'une connexion entrante sans consommer les données.
-// L'élément srtsrc est nommé "srcsrc" pour que connect_caller_signals le trouve.
-func buildProbePipeline(port, latency int) string {
-	return fmt.Sprintf(`srtsrc name=srcsrc uri="%s" ! fakesink sync=false`, srtListenerURI(port, latency))
-}
-
-// buildVideoRecvPipeline construit le pipeline GStreamer pour recevoir de l'AV1 via SRT.
+// buildVideoPipeline construit le pipeline GStreamer pour décoder de l'AV1 OBU.
 //
 // La Jetson envoie de l'AV1 OBU stream brut (nvv4l2av1enc → av1parse → srtsink).
-// av1parse côté receiver resynchronise sur les OBU headers et aligne sur les
-// temporal units (alignment=tu) : chaque buffer appsink = une trame AV1 complète
-// prête pour WriteSample LiveKit.
-func buildVideoRecvPipeline(port, latency int) string {
-	return fmt.Sprintf(
-		`srtsrc name=srcsrc uri="%s" ! `+
-			`av1parse ! video/x-av1,stream-format=obu-stream,alignment=tu ! `+
-			`appsink name=sink max-buffers=4 drop=true sync=false`,
-		srtListenerURI(port, latency),
-	)
+// On injecte ces octets dans appsrc ; av1parse resynchronise et aligne sur les
+// temporal units (alignment=tu) — chaque buffer appsink = une trame AV1 complète.
+func buildVideoPipeline() string {
+	return `appsrc name=src caps="video/x-av1,stream-format=obu-stream" ` +
+		`format=bytes is-live=true ! ` +
+		`av1parse ! video/x-av1,stream-format=obu-stream,alignment=tu ! ` +
+		`appsink name=sink max-buffers=4 drop=true sync=false`
 }
 
-// buildAudioRecvPipeline construit le pipeline GStreamer pour recevoir de l'Opus via SRT.
+// buildAudioPipeline construit le pipeline GStreamer pour recevoir de l'Opus.
 //
 // La Jetson envoie des trames Opus brutes (opusenc → srtsink).
-// SRT étant orienté message, chaque message SRT = un buffer GStreamer = une trame Opus.
-func buildAudioRecvPipeline(port, latency int) string {
-	return fmt.Sprintf(
-		`srtsrc name=srcsrc uri="%s" ! `+
-			`queue max-buffers=16 leaky=downstream ! `+
-			`appsink name=sink max-buffers=16 drop=true sync=false`,
-		srtListenerURI(port, latency),
-	)
+// SRT étant orienté message, chaque srt_recvmsg = un buffer GStreamer = une trame Opus.
+func buildAudioPipeline() string {
+	return `appsrc name=src caps="audio/x-opus,rate=48000,channels=2" ` +
+		`format=bytes is-live=true ! ` +
+		`queue max-buffers=16 leaky=downstream ! ` +
+		`appsink name=sink max-buffers=16 drop=true sync=false`
 }
 
-// RunStreams démarre un listener SRT par port de la plage cfg.SRT et les publie
-// dans room. Chaque port est totalement autonome et se reconnecte automatiquement.
-// Bloque jusqu'à l'annulation de ctx.
-func RunStreams(ctx context.Context, cfg config.Config, room *lksdk.Room, wg *sync.WaitGroup) {
-	for port := cfg.SRT.PortStart; port <= cfg.SRT.PortEnd; port++ {
-		p := port
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			runStreamLoop(ctx, p, cfg.SRT.Latency, room)
-		}()
+// roomMeta conserve les dernières données de chaque flux de télémétrie.
+// Elle fusionne ups et modem en un seul objet JSON envoyé à LiveKit.
+type roomMeta struct {
+	mu    sync.Mutex
+	fields map[string]json.RawMessage
+}
+
+// update stocke les données pour la clé donnée et retourne le JSON fusionné.
+func (m *roomMeta) update(key string, data json.RawMessage) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.fields == nil {
+		m.fields = make(map[string]json.RawMessage)
 	}
-}
-
-// runStreamLoop boucle indéfiniment pour un port donné :
-//  1. Lance un probe pour détecter le type de flux (phase 1).
-//  2. Lance le vrai pipeline typé et publie dans LiveKit (phase 2).
-//  3. Recommence dès la déconnexion de la Jetson.
-func runStreamLoop(ctx context.Context, port, latency int, room *lksdk.Room) {
-	for {
-		if ctx.Err() != nil {
-			return
+	m.fields[key] = data
+	// Construire le JSON fusionné en préservant l'ordre : ups, modem, puis autres.
+	order := []string{"ups", "modem"}
+	seen := make(map[string]bool, len(order))
+	var sb strings.Builder
+	sb.WriteByte('{')
+	first := true
+	for _, k := range order {
+		if v, ok := m.fields[k]; ok {
+			if !first {
+				sb.WriteByte(',')
+			}
+			fmt.Fprintf(&sb, "%q:%s", k, v)
+			first = false
+			seen[k] = true
 		}
-
-		// Phase 1 : probe — lire le streamid pour connaître le type de flux.
-		logger.Info("[stream:port=%d] En attente de connexion SRT (probe)...", port)
-		mediaType, err := probeStreamID(ctx, port, latency)
-		if err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			logger.Error("[stream:port=%d] Probe : %v — nouvelle tentative dans 2s", port, err)
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(2 * time.Second):
-			}
+	}
+	for k, v := range m.fields {
+		if seen[k] {
 			continue
 		}
+		if !first {
+			sb.WriteByte(',')
+		}
+		fmt.Fprintf(&sb, "%q:%s", k, v)
+		first = false
+	}
+	sb.WriteByte('}')
+	return sb.String()
+}
 
-		// Phase 2 : pipeline typé + publication LiveKit.
-		// La Jetson se reconnecte automatiquement après la fin du probe.
-		logger.Info("[stream:port=%d] Type détecté : %s — démarrage du pipeline", port, mediaType)
-		if err := runOnce(ctx, port, mediaType, latency, room); err != nil {
-			if ctx.Err() != nil {
-				return
+// RunStreams démarre un listener SRT sur cfg.SRT.Port et accepte toutes les
+// connexions entrantes. Chaque connexion est gérée dans sa propre goroutine.
+func RunStreams(ctx context.Context, cfg config.Config, room *lksdk.Room, wg *sync.WaitGroup) {
+	listener, err := newSRTListener(cfg.SRT.Port, cfg.SRT.Latency)
+	if err != nil {
+		logger.Fatal("[srt] Listener port %d : %v", cfg.SRT.Port, err)
+	}
+
+	// Fermer le listener quand le contexte est annulé (débloque Accept).
+	go func() {
+		<-ctx.Done()
+		listener.Close()
+	}()
+
+	logger.Info("[srt] Listener démarré sur le port %d (latency=%d ms)", cfg.SRT.Port, cfg.SRT.Latency)
+
+	// État partagé pour fusionner les télémétries (ups, modem…) en un seul JSON.
+	meta := &roomMeta{}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			conn, streamID, err := listener.Accept()
+			if err != nil {
+				if ctx.Err() != nil {
+					return // arrêt normal
+				}
+				logger.Error("[srt] Accept : %v — nouvelle tentative...", err)
+				continue
 			}
-			logger.Error("[stream:port=%d] %v — nouvelle tentative dans 2s", port, err)
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(2 * time.Second):
+			name, source := parseStreamID(streamID)
+			wg.Add(1)
+			if source == "ups" || source == "modem" {
+				logger.Info("[telemetry:%s] Connexion entrante", source)
+				go func(src string) {
+					defer wg.Done()
+					runTelemetry(ctx, conn, src, cfg, meta)
+				}(source)
+			} else {
+				mediaType := mediaTypeFromSource(source)
+				logger.Info("[stream:%s] Connexion entrante (streamid=%q, type=%s)", name, streamID, mediaType)
+				go func(n, s, mt string) {
+					defer wg.Done()
+					runStream(ctx, conn, n, s, mt, room)
+				}(name, source, mediaType)
 			}
 		}
-	}
+	}()
 }
 
-// probeStreamID démarre un pipeline probe sur le port, attend le premier
-// caller-added SRT, lit le streamid et retourne le type de média correspondant.
-// Le probe s'arrête immédiatement après la détection, libérant le port pour
-// le vrai pipeline. La Jetson (en mode caller) se reconnecte automatiquement.
-func probeStreamID(ctx context.Context, port, latency int) (mediaType string, err error) {
-	probe, err := newGstProbe(buildProbePipeline(port, latency))
-	if err != nil {
-		return "", fmt.Errorf("création probe : %w", err)
-	}
-	defer probe.Free()
-
-	if err := probe.Start(); err != nil {
-		return "", fmt.Errorf("démarrage probe : %w", err)
-	}
-	defer probe.Stop()
-
-	select {
-	case <-ctx.Done():
-		return "", ctx.Err()
-	case err := <-probe.ErrCh():
-		return "", err
-	case ev := <-probe.CallerEvents():
-		_, source := parseStreamID(ev.streamID)
-		return mediaTypeFromSource(source), nil
-	}
-}
-
-// runOnce gère un cycle complet sur le pipeline typé :
-//  1. Crée et démarre le pipeline (lie le port SRT).
-//  2. Attend caller-added → lit le streamid → publie le track LiveKit.
-//  3. Formate les frames vers WriteSample LiveKit.
-//  4. Sur caller-removed, EOS ou erreur : retire le track et retourne.
-func runOnce(ctx context.Context, port int, mediaType string, latency int, room *lksdk.Room) error {
+// runStream gère un cycle complet pour une connexion SRT acceptée :
+//  1. Crée et démarre le pipeline GStreamer (appsrc → … → appsink).
+//  2. Publie le track LiveKit immédiatement (type connu depuis le streamid).
+//  3. Goroutine SRT : recv → Push() dans l'appsrc.
+//  4. Boucle principale : Frames() → WriteSample LiveKit.
+//  5. Sur fermeture de connexion ou EOS : unpublish, Stop, Free.
+func runStream(ctx context.Context, conn *SRTConn, name, source, mediaType string, room *lksdk.Room) {
 	var pipelineStr string
 	switch mediaType {
 	case "video":
-		pipelineStr = buildVideoRecvPipeline(port, latency)
+		pipelineStr = buildVideoPipeline()
 	case "audio":
-		pipelineStr = buildAudioRecvPipeline(port, latency)
+		pipelineStr = buildAudioPipeline()
 	default:
-		return fmt.Errorf("type de flux inconnu : %q", mediaType)
+		logger.Error("[stream:%s] Type de média inconnu : %q — connexion fermée", name, mediaType)
+		conn.Close()
+		return
 	}
 
 	recv, err := newGstReceiver(pipelineStr)
 	if err != nil {
-		return fmt.Errorf("création pipeline : %w", err)
+		logger.Error("[stream:%s] Création pipeline : %v", name, err)
+		conn.Close()
+		return
 	}
-	defer recv.Free()
-
-	disconnectCh := make(chan struct{}, 1)
-	recv.SetOnDisconnect(func() {
-		select {
-		case disconnectCh <- struct{}{}:
-		default:
-		}
-	})
-
 	if err := recv.Start(); err != nil {
-		return fmt.Errorf("démarrage pipeline : %w", err)
+		logger.Error("[stream:%s] Démarrage pipeline : %v", name, err)
+		recv.Free()
+		conn.Close()
+		return
 	}
-	defer recv.Stop()
 
-	var (
-		track *lksdk.LocalSampleTrack
-		pub   *lksdk.LocalTrackPublication
-		name  string
-	)
+	track, pub, err := publishTrack(name, mediaType, source, room)
+	if err != nil {
+		logger.Error("[stream:%s] PublishTrack : %v", name, err)
+		recv.Stop()
+		recv.Free()
+		conn.Close()
+		return
+	}
 
-	unpublish := func() {
-		if pub != nil {
-			_ = room.LocalParticipant.UnpublishTrack(pub.SID())
-			logger.Info("[stream:%s] Track retiré de LiveKit", name)
-			pub = nil
-			track = nil
+	// Goroutine SRT → appsrc.
+	// Le goroutine possède conn et la ferme quand il se termine.
+	recvDone := make(chan struct{})
+	go func() {
+		defer close(recvDone)
+		defer conn.Close()
+		for {
+			data, recvErr := conn.Recv()
+			if recvErr != nil || data == nil {
+				recv.EndOfStream()
+				return
+			}
+			if pushErr := recv.Push(data); pushErr != nil {
+				logger.Warn("[stream:%s] Push appsrc : %v", name, pushErr)
+				recv.EndOfStream()
+				return
+			}
 		}
-	}
+	}()
 
+	// Boucle principale : appsink → LiveKit WriteSample.
+loop:
 	for {
 		select {
 		case <-ctx.Done():
-			unpublish()
-			return nil
-
-		case <-disconnectCh:
-			unpublish()
-			return nil
-
-		case ev, ok := <-recv.CallerEvents():
-			if !ok {
-				unpublish()
-				return nil
-			}
-			if ev.removed {
-				unpublish()
-				continue
-			}
-			// caller-added : publier le track LiveKit.
-			parsedName, source := parseStreamID(ev.streamID)
-			name = parsedName
-			logger.Info("[stream:%s] Jetson connecté (port %d) — publication dans LiveKit", name, port)
-			var pubErr error
-			track, pub, pubErr = publishTrack(name, mediaType, source, room)
-			if pubErr != nil {
-				logger.Error("[stream:port=%d] PublishTrack : %v", port, pubErr)
-			}
-
+			conn.Close()  // débloque le goroutine de réception SRT
+			<-recvDone
+			break loop
 		case f, ok := <-recv.Frames():
 			if !ok {
-				unpublish()
-				return nil
+				<-recvDone
+				break loop
 			}
-			if track == nil {
-				continue
-			}
-			if err := track.WriteSample(media.Sample{
+			if wErr := track.WriteSample(media.Sample{
 				Data:     f.Data,
 				Duration: f.Duration,
-			}, nil); err != nil {
-				logger.Warn("[stream:%s] WriteSample : %v", name, err)
+			}, nil); wErr != nil {
+				logger.Warn("[stream:%s] WriteSample : %v", name, wErr)
 			}
+		}
+	}
+
+	if pub != nil {
+		_ = room.LocalParticipant.UnpublishTrack(pub.SID())
+		logger.Info("[stream:%s] Track retiré de LiveKit", name)
+	}
+	recv.Stop()
+	recv.Free()
+}
+
+// runTelemetry lit les messages JSON d'un flux de télémétrie depuis une connexion SRT
+// et met à jour les métadonnées de la room LiveKit à chaque message reçu.
+// key identifie le flux ("ups", "modem", …) ; les données sont fusionnées dans meta
+// avant l'envoi pour ne pas écraser les données des autres flux.
+// Les métadonnées sont persistantes côté serveur : les clients qui rejoignent
+// la room après un envoi voient la dernière valeur sans délai d'attente.
+func runTelemetry(ctx context.Context, conn *SRTConn, key string, cfg config.Config, meta *roomMeta) {
+	defer conn.Close()
+	client := lksdk.NewRoomServiceClient(cfg.LiveKit.APIURL(), cfg.LiveKit.APIKey, cfg.LiveKit.APISecret)
+
+	for {
+		data, err := conn.Recv()
+		if err != nil || data == nil {
+			logger.Info("[telemetry:%s] Connexion fermée", key)
+			return
+		}
+
+		// Valider le JSON reçu avant de l'intégrer dans les métadonnées.
+		if !json.Valid(data) {
+			logger.Warn("[telemetry:%s] Message non-JSON ignoré", key)
+			continue
+		}
+
+		// Fusionner avec les autres flux de télémétrie déjà reçus.
+		merged := meta.update(key, json.RawMessage(data))
+
+		if _, err := client.UpdateRoomMetadata(ctx, &lkproto.UpdateRoomMetadataRequest{
+			Room:     cfg.LiveKit.Room,
+			Metadata: merged,
+		}); err != nil && ctx.Err() == nil {
+			logger.Warn("[telemetry:%s] UpdateRoom : %v", key, err)
 		}
 	}
 }
@@ -273,9 +290,8 @@ func parseStreamID(streamID string) (name, source string) {
 	return
 }
 
-// mediaTypeFromSource déduit le type de média GStreamer depuis la source LiveKit.
+// mediaTypeFromSource déduit le type de média depuis la source LiveKit.
 // "microphone" → "audio" (pipeline Opus), tout autre → "video" (pipeline AV1).
-// Extensible : ajouter une nouvelle source ici pour supporter un nouveau type de flux.
 func mediaTypeFromSource(source string) string {
 	if source == "microphone" {
 		return "audio"

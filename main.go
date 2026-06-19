@@ -58,8 +58,7 @@ func main() {
 	var wg sync.WaitGroup
 	pipeline.RunStreams(ctx, cfg, room, &wg)
 
-	total := cfg.SRT.PortEnd - cfg.SRT.PortStart + 1
-	logger.Info("Receiver démarré — plage SRT %d-%d (%d port(s)). Ctrl+C pour arrêter.", cfg.SRT.PortStart, cfg.SRT.PortEnd, total)
+	logger.Info("Receiver démarré — port SRT %d. Ctrl+C pour arrêter.", cfg.SRT.Port)
 	<-ctx.Done()
 	logger.Info("Signal reçu — arrêt en cours...")
 
