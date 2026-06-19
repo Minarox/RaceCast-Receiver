@@ -32,9 +32,11 @@ import (
 	"racecast-receiver/internal/logger"
 )
 
-// srtListenerURI construit l'URI SRT pour un listener sur le port donné.
+// srtListenerURI construit l'URI SRT pour un listener dual-stack (IPv4 + IPv6) sur le port donné.
+// Sur Linux, lier à [::] avec IPV6_V6ONLY=0 (valeur système par défaut) crée un socket
+// dual-stack qui accepte à la fois les connexions IPv4 et IPv6.
 func srtListenerURI(port, latency int) string {
-	return fmt.Sprintf("srt://:%d?mode=listener&latency=%d", port, latency)
+	return fmt.Sprintf("srt://[::]:%d?mode=listener&latency=%d", port, latency)
 }
 
 // buildProbePipeline construit le pipeline GStreamer minimal pour détecter le
