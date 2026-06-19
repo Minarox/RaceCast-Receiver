@@ -46,7 +46,7 @@ func buildVideoPipeline() string {
 func buildAudioPipeline() string {
 	return `appsrc name=src caps="audio/x-opus,rate=48000,channels=2" ` +
 		`format=bytes is-live=true ! ` +
-		`queue max-buffers=16 leaky=downstream ! ` +
+		`queue max-size-buffers=16 leaky=downstream ! ` +
 		`appsink name=sink max-buffers=16 drop=true sync=false`
 }
 
