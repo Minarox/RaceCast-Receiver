@@ -36,13 +36,15 @@ func main() {
 	log.SetOutput(io.Discard)
 	lkprotoLogger.SetLogger(nullLogger{}, "racecast-receiver")
 
+	if err := pipeline.CheckGStreamer(); err != nil {
+		logger.Fatal("GStreamer : %v", err)
+	}
+
 	if cfg.LiveKit.Domain == "" {
 		logger.Fatal("RC_LIVEKIT_DOMAIN non défini")
 	}
 
-	if err := ensureRoom(cfg); err != nil {
-		logger.Fatal("LiveKit ensureRoom : %v", err)
-	}
+	ensureRoom(cfg)
 
 	room, err := connectLiveKit(cfg)
 	if err != nil {
@@ -72,7 +74,7 @@ func main() {
 }
 
 // ensureRoom crée la room LiveKit si elle n'existe pas encore.
-func ensureRoom(cfg config.Config) error {
+func ensureRoom(cfg config.Config) {
 	client := lksdk.NewRoomServiceClient(cfg.LiveKit.APIURL(), cfg.LiveKit.APIKey, cfg.LiveKit.APISecret)
 	_, err := client.CreateRoom(context.Background(), &livekit.CreateRoomRequest{
 		Name:             cfg.LiveKit.Room,
@@ -83,7 +85,6 @@ func ensureRoom(cfg config.Config) error {
 	} else {
 		logger.Info("[livekit] Room %q créée (DepartureTimeout=24h)", cfg.LiveKit.Room)
 	}
-	return nil
 }
 
 // connectLiveKit se connecte à la room LiveKit et retourne le client Room.

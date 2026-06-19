@@ -130,6 +130,15 @@ package pipeline
 // static void send_eos(GstElement *pipeline) {
 //     gst_element_send_event(pipeline, gst_event_new_eos());
 // }
+//
+// // Vérifie que le plugin SRT GStreamer est disponible en tentant de créer
+// // un élément srtsrc. Retourne 1 si OK, 0 si le plugin est absent.
+// static int check_srt_plugin(void) {
+//     GstElement *e = gst_element_factory_make("srtsrc", NULL);
+//     if (!e) return 0;
+//     gst_object_unref(e);
+//     return 1;
+// }
 import "C"
 
 import (
@@ -145,6 +154,33 @@ import (
 func init() {
 	C.gst_init(nil, nil)
 	C.gst_debug_set_active(C.FALSE)
+}
+
+// CheckGStreamer vérifie que GStreamer est correctement initialisé et que le
+// plugin SRT (srtsrc/srtsink) est disponible. Doit être appelé au démarrage.
+func CheckGStreamer() error {
+	if C.check_srt_plugin() == 0 {
+		return fmt.Errorf(
+			"plugin SRT GStreamer introuvable — installez : " +
+				"apt install gstreamer1.0-plugins-bad libsrt-gnutls-dev",
+		)
+	}
+	return nil
+}
+
+// parseLaunch crée un pipeline GStreamer depuis sa description textuelle.
+// Retourne une erreur si la syntaxe est invalide ou si un élément est introuvable.
+func parseLaunch(pipelineStr string) (*C.GstElement, error) {
+	cStr := C.CString(pipelineStr)
+	defer C.free(unsafe.Pointer(cStr))
+	var gerr *C.GError
+	gp := C.gst_parse_launch(cStr, &gerr)
+	if gerr != nil {
+		msg := C.GoString((*C.char)(unsafe.Pointer(gerr.message)))
+		C.g_error_free(gerr)
+		return nil, fmt.Errorf("gst_parse_launch : %s", msg)
+	}
+	return gp, nil
 }
 
 // Frame contient un buffer encodé extrait de l'appsink GStreamer.
@@ -175,15 +211,9 @@ type GstReceiver struct {
 //   - un appsink nommé "sink"
 //   - un srtsrc nommé "srcsrc" (pour connecter les signaux caller-added/removed)
 func newGstReceiver(pipelineStr string) (*GstReceiver, error) {
-	cStr := C.CString(pipelineStr)
-	defer C.free(unsafe.Pointer(cStr))
-
-	var gerr *C.GError
-	gp := C.gst_parse_launch(cStr, &gerr)
-	if gerr != nil {
-		msg := C.GoString((*C.char)(unsafe.Pointer(gerr.message)))
-		C.g_error_free(gerr)
-		return nil, fmt.Errorf("gst_parse_launch : %s", msg)
+	gp, err := parseLaunch(pipelineStr)
+	if err != nil {
+		return nil, err
 	}
 
 	sinkName := C.CString("sink")
@@ -396,15 +426,9 @@ type GstProbe struct {
 // newGstProbe crée un pipeline probe depuis une description.
 // Le pipeline doit contenir un srtsrc nommé "srcsrc".
 func newGstProbe(pipelineStr string) (*GstProbe, error) {
-	cStr := C.CString(pipelineStr)
-	defer C.free(unsafe.Pointer(cStr))
-
-	var gerr *C.GError
-	gp := C.gst_parse_launch(cStr, &gerr)
-	if gerr != nil {
-		msg := C.GoString((*C.char)(unsafe.Pointer(gerr.message)))
-		C.g_error_free(gerr)
-		return nil, fmt.Errorf("gst_parse_launch (probe) : %s", msg)
+	gp, err := parseLaunch(pipelineStr)
+	if err != nil {
+		return nil, fmt.Errorf("probe : %w", err)
 	}
 
 	evCh := make(chan callerEvent, 4)
@@ -454,7 +478,7 @@ func (p *GstProbe) Free() {
 	}
 }
 
-// watchBus surveille le bus du pipeline probe et signale les erreurs fatales.
+// watchBus surveille le bus du pipeline probe et signale les erreurs fatales ou l'EOS.
 func (p *GstProbe) watchBus() {
 	bus := C.get_bus(p.pipeline)
 	if bus == nil {
@@ -470,17 +494,25 @@ func (p *GstProbe) watchBus() {
 		}
 		var cMsg, cDbg *C.char
 		ret := C.pop_bus_message(bus, &cMsg, &cDbg)
-		msg := ""
+		msg, dbg := "", ""
 		if cMsg != nil {
 			msg = C.GoString(cMsg)
 			C.g_free(C.gpointer(unsafe.Pointer(cMsg)))
 		}
 		if cDbg != nil {
+			dbg = C.GoString(cDbg)
 			C.g_free(C.gpointer(unsafe.Pointer(cDbg)))
 		}
-		if ret == 1 {
+		switch ret {
+		case 1:
 			select {
-			case p.errCh <- fmt.Errorf("erreur pipeline probe : %s", msg):
+			case p.errCh <- fmt.Errorf("erreur pipeline probe : %s — %s", msg, dbg):
+			default:
+			}
+			return
+		case 3:
+			select {
+			case p.errCh <- fmt.Errorf("EOS inattendu sur le pipeline probe"):
 			default:
 			}
 			return

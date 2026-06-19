@@ -32,14 +32,16 @@ import (
 	"racecast-receiver/internal/logger"
 )
 
+// srtListenerURI construit l'URI SRT pour un listener sur le port donné.
+func srtListenerURI(port, latency int) string {
+	return fmt.Sprintf("srt://:%d?mode=listener&latency=%d", port, latency)
+}
+
 // buildProbePipeline construit le pipeline GStreamer minimal pour détecter le
 // streamid SRT d'une connexion entrante sans consommer les données.
 // L'élément srtsrc est nommé "srcsrc" pour que connect_caller_signals le trouve.
 func buildProbePipeline(port, latency int) string {
-	return fmt.Sprintf(
-		`srtsrc name=srcsrc uri="srt://:%d?mode=listener&latency=%d" ! fakesink sync=false`,
-		port, latency,
-	)
+	return fmt.Sprintf(`srtsrc name=srcsrc uri="%s" ! fakesink sync=false`, srtListenerURI(port, latency))
 }
 
 // buildVideoRecvPipeline construit le pipeline GStreamer pour recevoir de l'AV1 via SRT.
@@ -50,10 +52,10 @@ func buildProbePipeline(port, latency int) string {
 // prête pour WriteSample LiveKit.
 func buildVideoRecvPipeline(port, latency int) string {
 	return fmt.Sprintf(
-		`srtsrc name=srcsrc uri="srt://:%d?mode=listener&latency=%d" ! `+
+		`srtsrc name=srcsrc uri="%s" ! `+
 			`av1parse ! video/x-av1,stream-format=obu-stream,alignment=tu ! `+
 			`appsink name=sink max-buffers=4 drop=true sync=false`,
-		port, latency,
+		srtListenerURI(port, latency),
 	)
 }
 
@@ -63,10 +65,10 @@ func buildVideoRecvPipeline(port, latency int) string {
 // SRT étant orienté message, chaque message SRT = un buffer GStreamer = une trame Opus.
 func buildAudioRecvPipeline(port, latency int) string {
 	return fmt.Sprintf(
-		`srtsrc name=srcsrc uri="srt://:%d?mode=listener&latency=%d" ! `+
+		`srtsrc name=srcsrc uri="%s" ! `+
 			`queue max-buffers=16 leaky=downstream ! `+
 			`appsink name=sink max-buffers=16 drop=true sync=false`,
-		port, latency,
+		srtListenerURI(port, latency),
 	)
 }
 
@@ -227,9 +229,10 @@ func runOnce(ctx context.Context, port int, mediaType string, latency int, room 
 			parsedName, source := parseStreamID(ev.streamID)
 			name = parsedName
 			logger.Info("[stream:%s] Jetson connecté (port %d) — publication dans LiveKit", name, port)
-			track, pub, err = publishTrack(name, mediaType, source, room)
-			if err != nil {
-				logger.Error("[stream:port=%d] PublishTrack : %v", port, err)
+			var pubErr error
+			track, pub, pubErr = publishTrack(name, mediaType, source, room)
+			if pubErr != nil {
+				logger.Error("[stream:port=%d] PublishTrack : %v", port, pubErr)
 			}
 
 		case f, ok := <-recv.Frames():
