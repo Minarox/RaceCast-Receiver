@@ -14,7 +14,7 @@ package pipeline
 //
 // // srt_new_listener creates a dual-stack (IPv4 + IPv6) SRT listener socket.
 // // Returns SRT_INVALID_SOCK on error.
-// static SRTSOCKET srt_new_listener(int port, int latency) {
+// static SRTSOCKET srt_new_listener(int port, int latency, const char *passphrase) {
 //     srt_startup(); // idempotent, safe to call multiple times
 //     SRTSOCKET s = srt_create_socket();
 //     if (s == SRT_INVALID_SOCK) return SRT_INVALID_SOCK;
@@ -26,6 +26,13 @@ package pipeline
 //     // Receive latency (inherited by accepted connections).
 //     int lat = latency;
 //     srt_setsockflag(s, SRTO_RCVLATENCY, &lat, sizeof(lat));
+//
+//     // Passphrase authentication: reject connections with wrong key (AES-256).
+//     if (passphrase && strlen(passphrase) >= 10) {
+//         srt_setsockflag(s, SRTO_PASSPHRASE, passphrase, (int)strlen(passphrase));
+//         int pbkeylen = 32;
+//         srt_setsockflag(s, SRTO_PBKEYLEN, &pbkeylen, sizeof(pbkeylen));
+//     }
 //
 //     struct sockaddr_in6 addr;
 //     memset(&addr, 0, sizeof(addr));
@@ -93,6 +100,8 @@ import "C"
 
 import (
 	"fmt"
+	"os"
+	"strings"
 	"unsafe"
 )
 
@@ -107,8 +116,13 @@ type SRTListener struct {
 
 // newSRTListener creates a dual-stack SRT listener on the given port.
 // latency is the SRT latency in milliseconds, inherited by incoming connections.
+// The passphrase is read from RC_SRT_PASSPHRASE; if set, AES-256 is required
+// on every incoming connection — connections with the wrong key are rejected.
 func newSRTListener(port, latency int) (*SRTListener, error) {
-	sock := C.srt_new_listener(C.int(port), C.int(latency))
+	passphrase := strings.TrimSpace(os.Getenv("RC_SRT_PASSPHRASE"))
+	cPass := C.CString(passphrase)
+	defer C.free(unsafe.Pointer(cPass))
+	sock := C.srt_new_listener(C.int(port), C.int(latency), cPass)
 	if C.srt_is_invalid(sock) != 0 {
 		return nil, fmt.Errorf("srt_new_listener on port %d: %s", port, C.GoString(C.srt_getlasterror_str()))
 	}
