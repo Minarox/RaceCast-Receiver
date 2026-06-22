@@ -57,6 +57,74 @@ type roomMeta struct {
 	fields map[string]json.RawMessage
 }
 
+// feedbackMsg is the JSON signal sent from the receiver to the emitter when
+// the AV1 decoder pipeline emits a non-fatal bitstream warning.
+// The emitter reacts by forcing an immediate IDR frame on the encoder.
+type feedbackMsg struct {
+	RequestIDR bool `json:"request_idr"`
+}
+
+// connRegistry tracks active SRT video connections and the IDR signal channels
+// of their associated feedback goroutines.
+type connRegistry struct {
+	mu     sync.RWMutex
+	conns  map[string]*SRTConn      // camera name → active SRT video connection
+	idrChs map[string]chan struct{} // camera name → feedback goroutine signal channel
+}
+
+func newConnRegistry() *connRegistry {
+	return &connRegistry{
+		conns:  make(map[string]*SRTConn),
+		idrChs: make(map[string]chan struct{}),
+	}
+}
+
+func (r *connRegistry) register(name string, conn *SRTConn) {
+	r.mu.Lock()
+	r.conns[name] = conn
+	r.mu.Unlock()
+}
+
+func (r *connRegistry) unregister(name string) {
+	r.mu.Lock()
+	delete(r.conns, name)
+	r.mu.Unlock()
+}
+
+func (r *connRegistry) get(name string) *SRTConn {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.conns[name]
+}
+
+// setIDRCh registers the channel used by the feedback goroutine for name.
+func (r *connRegistry) setIDRCh(name string, ch chan struct{}) {
+	r.mu.Lock()
+	r.idrChs[name] = ch
+	r.mu.Unlock()
+}
+
+// removeIDRCh deregisters the IDR channel when the feedback connection closes.
+func (r *connRegistry) removeIDRCh(name string) {
+	r.mu.Lock()
+	delete(r.idrChs, name)
+	r.mu.Unlock()
+}
+
+// requestIDR sends a non-blocking IDR signal to the feedback goroutine.
+// Called from the GstReceiver decode-warning callback.
+func (r *connRegistry) requestIDR(name string) {
+	r.mu.RLock()
+	ch := r.idrChs[name]
+	r.mu.RUnlock()
+	if ch != nil {
+		select {
+		case ch <- struct{}{}:
+		default: // already pending — ignore duplicate
+		}
+	}
+}
+
 // update stores data for the given key and returns the merged JSON.
 func (m *roomMeta) update(key string, data json.RawMessage) string {
 	m.mu.Lock()
@@ -114,6 +182,10 @@ func RunStreams(ctx context.Context, cfg config.Config, room *lksdk.Room, wg *sy
 	// Shared state to merge telemetry streams into a single JSON object.
 	meta := &roomMeta{}
 
+	// Registry of active SRT video connections indexed by camera name.
+	// Used by feedback goroutines to read per-stream SRT statistics.
+	registry := newConnRegistry()
+
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -128,18 +200,25 @@ func RunStreams(ctx context.Context, cfg config.Config, room *lksdk.Room, wg *sy
 			}
 			name, source := parseStreamID(streamID)
 			wg.Add(1)
-			if source == "ups" || source == "modem" {
+			switch source {
+			case "ups", "modem":
 				logger.Info("[telemetry:%s] Incoming connection", source)
 				go func(src string) {
 					defer wg.Done()
 					runTelemetry(ctx, conn, src, cfg, meta)
 				}(source)
-			} else {
+			case "feedback":
+				logger.Info("[feedback:%s] Incoming feedback connection", name)
+				go func(n string) {
+					defer wg.Done()
+					runFeedback(ctx, conn, n, registry)
+				}(name)
+			default:
 				mediaType := mediaTypeFromSource(source)
 				logger.Info("[stream:%s] Incoming connection (streamid=%q, type=%s)", name, streamID, mediaType)
 				go func(n, s, mt string) {
 					defer wg.Done()
-					runStream(ctx, conn, n, s, mt, room)
+					runStream(ctx, conn, n, s, mt, room, registry)
 				}(name, source, mediaType)
 			}
 		}
@@ -152,7 +231,7 @@ func RunStreams(ctx context.Context, cfg config.Config, room *lksdk.Room, wg *sy
 //  3. SRT goroutine: recv → Push() into appsrc.
 //  4. Main loop: Frames() → LiveKit WriteSample.
 //  5. On connection close or EOS: unpublish, Stop, Free.
-func runStream(ctx context.Context, conn *SRTConn, name, source, mediaType string, room *lksdk.Room) {
+func runStream(ctx context.Context, conn *SRTConn, name, source, mediaType string, room *lksdk.Room, registry *connRegistry) {
 	var pipelineStr string
 	switch mediaType {
 	case "video":
@@ -185,6 +264,15 @@ func runStream(ctx context.Context, conn *SRTConn, name, source, mediaType strin
 		recv.Free()
 		conn.Close()
 		return
+	}
+
+	// Register connection so the feedback goroutine can poll SRT stats.
+	registry.register(name, conn)
+	defer registry.unregister(name)
+
+	// Forward GStreamer AV1 decode warnings as IDR requests to the emitter.
+	if mediaType == "video" {
+		recv.SetOnDecodeWarning(func() { registry.requestIDR(name) })
 	}
 
 	// SRT → appsrc goroutine. Owns conn and closes it when done.
@@ -343,5 +431,35 @@ func trackSource(s string) lkproto.TrackSource {
 		return lkproto.TrackSource_MICROPHONE
 	default:
 		return lkproto.TrackSource_CAMERA
+	}
+}
+
+// runFeedback listens for IDR request signals from the emitter's receiver-side
+// decode-warning callback. It is event-driven: a message is only sent when the
+// GstReceiver pipeline emits a non-fatal AV1 bitstream warning, so no
+// periodic polling or network stats round-trip is needed.
+func runFeedback(ctx context.Context, conn *SRTConn, cameraName string, registry *connRegistry) {
+	defer conn.Close()
+
+	// Create a buffered channel (capacity 1) so duplicate rapid warnings coalesce.
+	idrCh := make(chan struct{}, 1)
+	registry.setIDRCh(cameraName, idrCh)
+	defer registry.removeIDRCh(cameraName)
+
+	logger.Info("[feedback:%s] IDR request listener active", cameraName)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-idrCh:
+			msg := feedbackMsg{RequestIDR: true}
+			data, _ := json.Marshal(msg)
+			if err := conn.Send(data); err != nil {
+				logger.Warn("[feedback:%s] Send failed: %v", cameraName, err)
+				return
+			}
+			logger.Info("[feedback:%s] IDR request sent to emitter (decode warning)", cameraName)
+		}
 	}
 }

@@ -69,6 +69,26 @@ package pipeline
 // static int srt_is_invalid(SRTSOCKET sock) {
 //     return sock == SRT_INVALID_SOCK ? 1 : 0;
 // }
+//
+// // srt_do_send sends a message to the connected SRT peer (bidirectional SRT).
+// // Returns >0=bytes sent, <0=error.
+// static int srt_do_send(SRTSOCKET sock, const char *buf, int len) {
+//     return srt_sendmsg(sock, buf, len, -1, 0);
+// }
+//
+// // srt_get_stats fills packet-loss %, RTT (ms) and bandwidth (Mbps) from
+// // interval SRT receive statistics (cleared after each call).
+// static void srt_get_stats(SRTSOCKET sock,
+//                           double *loss_pct, double *rtt_ms, double *bandwidth_mbps) {
+//     SRT_TRACEBSTATS st;
+//     *loss_pct = 0; *rtt_ms = 0; *bandwidth_mbps = 0;
+//     if (srt_bistats(sock, &st, 1, 0) == SRT_ERROR) return;
+//     *rtt_ms         = st.msRTT;
+//     *bandwidth_mbps = st.mbpsBandwidth;
+//     int64_t total = st.pktRecv + (int64_t)st.pktRcvLoss;
+//     if (total > 0)
+//         *loss_pct = 100.0 * (double)st.pktRcvLoss / (double)total;
+// }
 import "C"
 
 import (
@@ -134,4 +154,26 @@ func (c *SRTConn) Recv() ([]byte, error) {
 // Close closes the SRT connection.
 func (c *SRTConn) Close() {
 	C.srt_do_close(c.sock)
+}
+
+// Send sends data to the emitter via this SRT connection.
+// SRT connections are bidirectional; the accepted socket can write back to
+// the caller (emitter) using srt_sendmsg.
+func (c *SRTConn) Send(data []byte) error {
+	if len(data) == 0 {
+		return nil
+	}
+	n := C.srt_do_send(c.sock, (*C.char)(unsafe.Pointer(&data[0])), C.int(len(data)))
+	if n < 0 {
+		return fmt.Errorf("srt_sendmsg: %s", C.GoString(C.srt_getlasterror_str()))
+	}
+	return nil
+}
+
+// Stats returns the packet-loss percentage, RTT (ms) and estimated bandwidth
+// (Mbps) measured since the last call (interval stats, auto-cleared).
+func (c *SRTConn) Stats() (lossPct, rttMS, bandwidthMbps float64) {
+	var lp, rtt, bw C.double
+	C.srt_get_stats(c.sock, &lp, &rtt, &bw)
+	return float64(lp), float64(rtt), float64(bw)
 }

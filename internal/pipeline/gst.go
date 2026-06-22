@@ -151,13 +151,15 @@ type Frame struct {
 // Raw data (AV1 OBU or Opus) is injected via Push() into the "src" appsrc.
 // Processed frames are read via Frames().
 type GstReceiver struct {
-	pipeline *C.GstElement
-	appsrc   *C.GstElement
-	appsink  *C.GstElement
-	frames   chan Frame
-	ctx      context.Context
-	cancel   context.CancelFunc
-	wg       sync.WaitGroup
+	mu              sync.Mutex // protects onDecodeWarning
+	pipeline        *C.GstElement
+	appsrc          *C.GstElement
+	appsink         *C.GstElement
+	frames          chan Frame
+	ctx             context.Context
+	cancel          context.CancelFunc
+	wg              sync.WaitGroup
+	onDecodeWarning func()
 }
 
 // newGstReceiver creates a GStreamer pipeline from a description.
@@ -194,6 +196,15 @@ func newGstReceiver(pipelineStr string) (*GstReceiver, error) {
 		ctx:      ctx,
 		cancel:   cancel,
 	}, nil
+}
+
+// SetOnDecodeWarning registers a callback invoked when the GStreamer pipeline
+// emits a non-fatal warning (e.g., corrupted AV1 bitstream). The callback is
+// called in a separate goroutine and used to trigger IDR requests.
+func (r *GstReceiver) SetOnDecodeWarning(fn func()) {
+	r.mu.Lock()
+	r.onDecodeWarning = fn
+	r.mu.Unlock()
 }
 
 // Push injects a data buffer into the pipeline's appsrc.
@@ -288,6 +299,12 @@ func (r *GstReceiver) watchBus() {
 			return
 		case 2:
 			logger.Warn("[gst] Warning: %s — %s", msg, dbg)
+			r.mu.Lock()
+			cb := r.onDecodeWarning
+			r.mu.Unlock()
+			if cb != nil {
+				go cb()
+			}
 		case 3:
 			r.cancel()
 			return
