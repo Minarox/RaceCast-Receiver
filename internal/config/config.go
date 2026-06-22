@@ -62,7 +62,7 @@ func Load() Config {
 		},
 		SRT: SRTConfig{
 			Port:    parseSRTPort(),
-			Latency: getEnvInt("RC_SRT_LATENCY", 2000),
+			Latency: getEnvInt("RC_SRT_LATENCY", 800),
 		},
 	}
 }
