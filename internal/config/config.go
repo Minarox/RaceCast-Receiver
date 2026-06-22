@@ -6,23 +6,23 @@ import (
 	"strconv"
 )
 
-// Config contient toute la configuration du receiver chargée depuis les variables d'environnement.
+// Config holds the full receiver configuration loaded from environment variables.
 type Config struct {
 	LiveKit LiveKitConfig
 	SRT     SRTConfig
 }
 
-// LiveKitConfig décrit la connexion au serveur LiveKit.
+// LiveKitConfig describes the LiveKit server connection.
 type LiveKitConfig struct {
-	TLS       bool   // RC_LIVEKIT_TLS (défaut true)
+	TLS       bool   // RC_LIVEKIT_TLS (default true)
 	Domain    string // RC_LIVEKIT_DOMAIN
 	APIKey    string // RC_LIVEKIT_API_KEY
 	APISecret string // RC_LIVEKIT_API_SECRET
-	Room      string // RC_LIVEKIT_ROOM (défaut "racecast")
-	Identity  string // RC_LIVEKIT_IDENTITY (défaut "racecast-receiver")
+	Room      string // RC_LIVEKIT_ROOM (default "racecast")
+	Identity  string // RC_LIVEKIT_IDENTITY (default "racecast-receiver")
 }
 
-// ServerURL retourne l'URL WebSocket LiveKit.
+// ServerURL returns the LiveKit WebSocket URL.
 func (c LiveKitConfig) ServerURL() string {
 	scheme := "wss"
 	if !c.TLS {
@@ -31,7 +31,7 @@ func (c LiveKitConfig) ServerURL() string {
 	return fmt.Sprintf("%s://%s", scheme, c.Domain)
 }
 
-// APIURL retourne l'URL HTTP de l'API LiveKit.
+// APIURL returns the LiveKit HTTP API URL.
 func (c LiveKitConfig) APIURL() string {
 	scheme := "https"
 	if !c.TLS {
@@ -40,17 +40,16 @@ func (c LiveKitConfig) APIURL() string {
 	return fmt.Sprintf("%s://%s", scheme, c.Domain)
 }
 
-// SRTConfig décrit les paramètres d'écoute SRT.
-//
-// Un seul port SRT est utilisé pour toutes les connexions entrantes.
-// Le type de flux (vidéo AV1, audio Opus, etc.) est déterminé dynamiquement
-// depuis le paramètre SRT streamid ("name:source") envoyé par la Jetson.
+// SRTConfig describes the SRT listener parameters.
+// A single SRT port is used for all incoming connections.
+// The stream type (AV1 video, Opus audio, etc.) is determined from the
+// SRT streamid parameter ("name:source") sent by the Jetson.
 type SRTConfig struct {
-	Port    int // RC_SRT_PORT : port d'écoute
-	Latency int // RC_SRT_LATENCY en ms (défaut 2000)
+	Port    int // RC_SRT_PORT: listen port
+	Latency int // RC_SRT_LATENCY in ms (default 2000)
 }
 
-// Load lit la configuration depuis les variables d'environnement.
+// Load reads configuration from environment variables.
 func Load() Config {
 	return Config{
 		LiveKit: LiveKitConfig{
@@ -68,7 +67,7 @@ func Load() Config {
 	}
 }
 
-// parseSRTPort lit RC_SRT_PORT et retourne le port configuré (défaut 9000).
+// parseSRTPort reads RC_SRT_PORT and returns the configured port (default 9000).
 func parseSRTPort() int {
 	if n, err := strconv.Atoi(os.Getenv("RC_SRT_PORT")); err == nil && n > 0 {
 		return n

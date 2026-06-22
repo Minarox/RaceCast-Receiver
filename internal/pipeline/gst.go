@@ -1,10 +1,10 @@
 package pipeline
 
-// gst.go gère les pipelines GStreamer appsrc→…→appsink utilisés pour décoder
-// les flux AV1 et Opus reçus via libsrt (listener.go).
+// gst.go manages GStreamer appsrc→…→appsink pipelines used to decode
+// AV1 and Opus streams received via libsrt (listener.go).
 //
-// Les données arrivent par Push() dans l'appsrc "src".
-// Les frames décodées sont lues par le consommateur via Frames().
+// Data arrives via Push() into the "src" appsrc.
+// Decoded frames are read by the consumer via Frames().
 
 // #cgo pkg-config: gstreamer-1.0 gstreamer-app-1.0
 // #include <gst/gst.h>
@@ -12,8 +12,8 @@ package pipeline
 // #include <gst/app/gstappsrc.h>
 // #include <stdlib.h>
 //
-// // push_buffer copie data dans un GstBuffer et l'envoie dans l'appsrc.
-// // gst_app_src_push_buffer prend la propriété du buffer (pas de free côté Go).
+// // push_buffer copies data into a GstBuffer and pushes it into appsrc.
+// // gst_app_src_push_buffer takes ownership of the buffer (no free on Go side).
 // static GstFlowReturn push_buffer(GstElement *src, const char *data, int len) {
 //     GstBuffer *buf = gst_buffer_new_allocate(NULL, (gsize)len, NULL);
 //     GstMapInfo m;
@@ -23,13 +23,13 @@ package pipeline
 //     return gst_app_src_push_buffer(GST_APP_SRC(src), buf);
 // }
 //
-// // eos_appsrc envoie un événement EOS dans l'appsrc ; il se propage jusqu'à l'appsink.
+// // eos_appsrc sends an EOS event into appsrc; it propagates to appsink.
 // static void eos_appsrc(GstElement *src) {
 //     gst_app_src_end_of_stream(GST_APP_SRC(src));
 // }
 //
-// // Passe le pipeline en PLAYING et attend la fin de l'initialisation asynchrone.
-// // Retourne 1 si succès, 0 sinon.
+// // Sets the pipeline to PLAYING and waits for async state change to complete.
+// // Returns 1 on success, 0 on failure.
 // static int start_pipeline(GstElement *pipeline) {
 //     GstStateChangeReturn ret = gst_element_set_state(pipeline, GST_STATE_PLAYING);
 //     if (ret == GST_STATE_CHANGE_ASYNC) {
@@ -43,8 +43,8 @@ package pipeline
 //     return gst_element_get_bus(pipeline);
 // }
 //
-// // Sonde le bus GStreamer (timeout 100 ms).
-// // Retourne 1=erreur, 2=avertissement, 3=eos, 0=rien.
+// // Poll the GStreamer bus (100 ms timeout).
+// // Returns 1=error, 2=warning, 3=eos, 0=nothing.
 // static int pop_bus_message(GstBus *bus, char **msg, char **dbg) {
 //     *msg = NULL; *dbg = NULL;
 //     GstMessage *m = gst_bus_timed_pop_filtered(bus, 100 * GST_MSECOND,
@@ -71,8 +71,8 @@ package pipeline
 //     return ret;
 // }
 //
-// // Pull une frame depuis l'appsink (timeout 1 s).
-// // Retourne GST_FLOW_OK, GST_FLOW_EOS, ou GST_FLOW_CUSTOM_ERROR (timeout).
+// // Pull a sample from appsink (1 s timeout).
+// // Returns GST_FLOW_OK, GST_FLOW_EOS, or GST_FLOW_CUSTOM_ERROR (timeout).
 // static GstFlowReturn pull_sample(GstElement *sink, GstSample **sample) {
 //     *sample = gst_app_sink_try_pull_sample(GST_APP_SINK(sink), GST_SECOND);
 //     if (*sample == NULL) {
@@ -90,8 +90,8 @@ package pipeline
 //     gst_element_send_event(pipeline, gst_event_new_eos());
 // }
 //
-// // Vérifie que le plugin SRT GStreamer est disponible en tentant de créer
-// // un élément srtsrc. Retourne 1 si OK, 0 si le plugin est absent.
+// // Check that the SRT GStreamer plugin is available by trying to create
+// // an srtsrc element. Returns 1 if OK, 0 if missing.
 // static int check_srt_plugin(void) {
 //     GstElement *e = gst_element_factory_make("srtsrc", NULL);
 //     if (!e) return 0;
@@ -115,20 +115,19 @@ func init() {
 	C.gst_debug_set_active(C.FALSE)
 }
 
-// CheckGStreamer vérifie que GStreamer est correctement initialisé et que le
-// plugin SRT (srtsrc/srtsink) est disponible. Doit être appelé au démarrage.
+// CheckGStreamer verifies that GStreamer is properly initialized and the SRT plugin
+// (srtsrc/srtsink) is available. Must be called at startup.
 func CheckGStreamer() error {
 	if C.check_srt_plugin() == 0 {
 		return fmt.Errorf(
-			"plugin SRT GStreamer introuvable — installez : " +
+			"SRT GStreamer plugin not found — install: " +
 				"apt install gstreamer1.0-plugins-bad libsrt-gnutls-dev",
 		)
 	}
 	return nil
 }
 
-// parseLaunch crée un pipeline GStreamer depuis sa description textuelle.
-// Retourne une erreur si la syntaxe est invalide ou si un élément est introuvable.
+// parseLaunch creates a GStreamer pipeline from its textual description.
 func parseLaunch(pipelineStr string) (*C.GstElement, error) {
 	cStr := C.CString(pipelineStr)
 	defer C.free(unsafe.Pointer(cStr))
@@ -137,20 +136,20 @@ func parseLaunch(pipelineStr string) (*C.GstElement, error) {
 	if gerr != nil {
 		msg := C.GoString((*C.char)(unsafe.Pointer(gerr.message)))
 		C.g_error_free(gerr)
-		return nil, fmt.Errorf("gst_parse_launch : %s", msg)
+		return nil, fmt.Errorf("gst_parse_launch: %s", msg)
 	}
 	return gp, nil
 }
 
-// Frame contient un buffer encodé extrait de l'appsink GStreamer.
+// Frame holds an encoded buffer extracted from the GStreamer appsink.
 type Frame struct {
 	Data     []byte
 	Duration time.Duration
 }
 
-// GstReceiver gère un pipeline GStreamer appsrc→…→appsink.
-// Les données brutes (AV1 OBU ou Opus) sont injectées via Push() dans l'appsrc "src".
-// Les frames traitées (AV1 temporal units ou Opus) sont lues via Frames().
+// GstReceiver manages a GStreamer appsrc→…→appsink pipeline.
+// Raw data (AV1 OBU or Opus) is injected via Push() into the "src" appsrc.
+// Processed frames are read via Frames().
 type GstReceiver struct {
 	pipeline *C.GstElement
 	appsrc   *C.GstElement
@@ -161,10 +160,8 @@ type GstReceiver struct {
 	wg       sync.WaitGroup
 }
 
-// newGstReceiver crée un pipeline GStreamer depuis une description.
-// Le pipeline doit contenir :
-//   - un appsrc nommé "src"
-//   - un appsink nommé "sink"
+// newGstReceiver creates a GStreamer pipeline from a description.
+// The pipeline must contain an appsrc named "src" and an appsink named "sink".
 func newGstReceiver(pipelineStr string) (*GstReceiver, error) {
 	gp, err := parseLaunch(pipelineStr)
 	if err != nil {
@@ -176,7 +173,7 @@ func newGstReceiver(pipelineStr string) (*GstReceiver, error) {
 	appsrc := C.gst_bin_get_by_name((*C.GstBin)(unsafe.Pointer(gp)), srcName)
 	if appsrc == nil {
 		C.gst_object_unref(C.gpointer(gp))
-		return nil, fmt.Errorf("appsrc 'src' introuvable dans le pipeline")
+		return nil, fmt.Errorf("appsrc 'src' not found in pipeline")
 	}
 
 	sinkName := C.CString("sink")
@@ -185,7 +182,7 @@ func newGstReceiver(pipelineStr string) (*GstReceiver, error) {
 	if appsink == nil {
 		C.gst_object_unref(C.gpointer(appsrc))
 		C.gst_object_unref(C.gpointer(gp))
-		return nil, fmt.Errorf("appsink 'sink' introuvable dans le pipeline")
+		return nil, fmt.Errorf("appsink 'sink' not found in pipeline")
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -199,27 +196,27 @@ func newGstReceiver(pipelineStr string) (*GstReceiver, error) {
 	}, nil
 }
 
-// Push injecte un buffer de données dans l'appsrc du pipeline.
+// Push injects a data buffer into the pipeline's appsrc.
 func (r *GstReceiver) Push(data []byte) error {
 	if len(data) == 0 {
 		return nil
 	}
 	ret := C.push_buffer(r.appsrc, (*C.char)(unsafe.Pointer(&data[0])), C.int(len(data)))
 	if ret != C.GST_FLOW_OK {
-		return fmt.Errorf("push_buffer : flow=%d", int(ret))
+		return fmt.Errorf("push_buffer: flow=%d", int(ret))
 	}
 	return nil
 }
 
-// EndOfStream signale la fin du flux à l'appsrc ; l'EOS se propage jusqu'à l'appsink.
+// EndOfStream signals end-of-stream to appsrc; the EOS propagates to appsink.
 func (r *GstReceiver) EndOfStream() {
 	C.eos_appsrc(r.appsrc)
 }
 
-// Start passe le pipeline en PLAYING.
+// Start sets the pipeline to PLAYING.
 func (r *GstReceiver) Start() error {
 	if C.start_pipeline(r.pipeline) == 0 {
-		return fmt.Errorf("impossible de démarrer le pipeline GStreamer")
+		return fmt.Errorf("failed to start GStreamer pipeline")
 	}
 	r.wg.Add(2)
 	go func() { defer r.wg.Done(); r.watchBus() }()
@@ -227,12 +224,12 @@ func (r *GstReceiver) Start() error {
 	return nil
 }
 
-// Frames retourne le canal de frames reçues depuis la Jetson.
+// Frames returns the channel of frames received from the Jetson.
 func (r *GstReceiver) Frames() <-chan Frame {
 	return r.frames
 }
 
-// Stop envoie EOS et attend l'arrêt propre (timeout 5 s).
+// Stop sends EOS and waits for clean shutdown (5 s timeout).
 func (r *GstReceiver) Stop() {
 	C.send_eos(r.pipeline)
 	done := make(chan struct{})
@@ -246,7 +243,7 @@ func (r *GstReceiver) Stop() {
 	C.gst_element_set_state(r.pipeline, C.GST_STATE_NULL)
 }
 
-// Free libère les ressources GStreamer et désenregistre le receiver.
+// Free releases GStreamer resources and unregisters the receiver.
 func (r *GstReceiver) Free() {
 	if r.appsrc != nil {
 		C.gst_object_unref(C.gpointer(r.appsrc))
@@ -259,7 +256,7 @@ func (r *GstReceiver) Free() {
 	}
 }
 
-// watchBus surveille les messages du bus GStreamer (erreur, avertissement, EOS).
+// watchBus monitors GStreamer bus messages (error, warning, EOS).
 func (r *GstReceiver) watchBus() {
 	bus := C.get_bus(r.pipeline)
 	if bus == nil {
@@ -286,11 +283,11 @@ func (r *GstReceiver) watchBus() {
 		}
 		switch ret {
 		case 1:
-			logger.Error("[gst] Erreur pipeline : %s — %s", msg, dbg)
+			logger.Error("[gst] Pipeline error: %s — %s", msg, dbg)
 			r.cancel()
 			return
 		case 2:
-			logger.Warn("[gst] Avertissement : %s — %s", msg, dbg)
+			logger.Warn("[gst] Warning: %s — %s", msg, dbg)
 		case 3:
 			r.cancel()
 			return
@@ -298,7 +295,7 @@ func (r *GstReceiver) watchBus() {
 	}
 }
 
-// loop tire les frames de l'appsink et les envoie sur le canal.
+// loop pulls frames from appsink and sends them to the channel.
 func (r *GstReceiver) loop() {
 	defer close(r.frames)
 
@@ -316,7 +313,7 @@ func (r *GstReceiver) loop() {
 			return
 		}
 		if flowRet == C.GST_FLOW_CUSTOM_ERROR {
-			continue // timeout 1 s, pas de frame disponible
+			continue // 1 s timeout, no frame available
 		}
 
 		buf := C.gst_sample_get_buffer(sample)
@@ -346,7 +343,7 @@ func (r *GstReceiver) loop() {
 
 		select {
 		case r.frames <- Frame{Data: data, Duration: dur}:
-		default: // consommateur trop lent : frame abandonnée
+		default: // consumer too slow: frame dropped
 		}
 	}
 }

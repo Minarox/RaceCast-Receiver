@@ -1,10 +1,10 @@
 package pipeline
 
-// listener.go implémente le listener SRT multi-connexions via libsrt directement.
+// listener.go implements a multi-connection SRT listener via libsrt directly.
 //
-// Contrairement à srtsrc GStreamer (une connexion à la fois par élément),
-// ce listener accepte N connexions simultanées sur un seul port et les route
-// par streamid SRT. Chaque connexion acceptée retourne son streamid immédiatement.
+// Unlike srtsrc GStreamer (one connection per element), this listener accepts
+// N simultaneous connections on a single port, routing by SRT streamid.
+// Each accepted connection returns its streamid immediately during the handshake.
 
 // #cgo pkg-config: srt
 // #include <srt/srt.h>
@@ -12,18 +12,18 @@ package pipeline
 // #include <string.h>
 // #include <stdlib.h>
 //
-// // srt_new_listener crée un socket SRT listener dual-stack (IPv4 + IPv6).
-// // Retourne SRT_INVALID_SOCK en cas d'erreur.
+// // srt_new_listener creates a dual-stack (IPv4 + IPv6) SRT listener socket.
+// // Returns SRT_INVALID_SOCK on error.
 // static SRTSOCKET srt_new_listener(int port, int latency) {
-//     srt_startup(); // idempotent, safe à appeler plusieurs fois
+//     srt_startup(); // idempotent, safe to call multiple times
 //     SRTSOCKET s = srt_create_socket();
 //     if (s == SRT_INVALID_SOCK) return SRT_INVALID_SOCK;
 //
-//     // Dual-stack : accepter IPv4 et IPv6 sur le même socket
+//     // Dual-stack: accept IPv4 and IPv6 on the same socket.
 //     int no = 0;
 //     srt_setsockflag(s, SRTO_IPV6ONLY, &no, sizeof(no));
 //
-//     // Latence de réception (héritée par les connexions acceptées)
+//     // Receive latency (inherited by accepted connections).
 //     int lat = latency;
 //     srt_setsockflag(s, SRTO_RCVLATENCY, &lat, sizeof(lat));
 //
@@ -41,8 +41,8 @@ package pipeline
 //     return s;
 // }
 //
-// // srt_do_accept attend une connexion entrante et lit son streamid.
-// // Retourne SRT_INVALID_SOCK si le listener est fermé ou en erreur.
+// // srt_do_accept waits for an incoming connection and reads its streamid.
+// // Returns SRT_INVALID_SOCK if the listener is closed or on error.
 // static SRTSOCKET srt_do_accept(SRTSOCKET listener, char *out, int maxlen) {
 //     struct sockaddr_storage addr;
 //     int addrlen = sizeof(addr);
@@ -54,18 +54,18 @@ package pipeline
 //     return conn;
 // }
 //
-// // srt_do_recv lit le prochain message SRT.
-// // Retourne >0=octets reçus, 0=connexion fermée, <0=erreur.
+// // srt_do_recv reads the next SRT message.
+// // Returns >0=bytes received, 0=connection closed, <0=error.
 // static int srt_do_recv(SRTSOCKET sock, char *buf, int maxlen) {
 //     return srt_recvmsg(sock, buf, maxlen);
 // }
 //
-// // srt_do_close ferme un socket SRT.
+// // srt_do_close closes an SRT socket.
 // static void srt_do_close(SRTSOCKET sock) {
 //     srt_close(sock);
 // }
 //
-// // srt_is_invalid retourne 1 si le socket est invalide (SRT_INVALID_SOCK est une macro).
+// // srt_is_invalid returns 1 if the socket is invalid.
 // static int srt_is_invalid(SRTSOCKET sock) {
 //     return sock == SRT_INVALID_SOCK ? 1 : 0;
 // }
@@ -76,65 +76,62 @@ import (
 	"unsafe"
 )
 
-// recvBufSize est la taille maximale d'un message SRT.
-// SRT garantit que chaque srt_recvmsg retourne un message complet.
-// La MTU SRT est ~1316 octets, mais les messages peuvent être fragmentés
-// et réassemblés jusqu'à cette limite.
-const recvBufSize = 1500 * 7 // ~10 Ko, largement suffisant pour une trame AV1/Opus
+// recvBufSize is the maximum SRT message size.
+// SRT guarantees srt_recvmsg returns a complete message.
+const recvBufSize = 1500 * 7 // ~10 KB, well above a single AV1/Opus frame
 
-// SRTListener encapsule un socket SRT en mode listener (port unique, N connexions).
+// SRTListener wraps an SRT socket in listener mode (single port, N connections).
 type SRTListener struct {
 	sock C.SRTSOCKET
 }
 
-// newSRTListener crée un listener SRT dual-stack sur le port donné.
-// latency est la latence SRT en millisecondes (héritée par les connexions entrantes).
+// newSRTListener creates a dual-stack SRT listener on the given port.
+// latency is the SRT latency in milliseconds, inherited by incoming connections.
 func newSRTListener(port, latency int) (*SRTListener, error) {
 	sock := C.srt_new_listener(C.int(port), C.int(latency))
 	if C.srt_is_invalid(sock) != 0 {
-		return nil, fmt.Errorf("srt_new_listener sur le port %d : %s", port, C.GoString(C.srt_getlasterror_str()))
+		return nil, fmt.Errorf("srt_new_listener on port %d: %s", port, C.GoString(C.srt_getlasterror_str()))
 	}
 	return &SRTListener{sock: sock}, nil
 }
 
-// Accept attend et accepte la prochaine connexion entrante.
-// Bloque jusqu'à une connexion ou jusqu'à la fermeture du listener (Close).
-// Retourne le streamid SRT envoyé par le caller lors du handshake.
+// Accept waits for and accepts the next incoming connection.
+// Blocks until a connection arrives or the listener is closed.
+// Returns the SRT streamid sent by the caller during the handshake.
 func (l *SRTListener) Accept() (*SRTConn, string, error) {
 	var buf [512]C.char
 	sock := C.srt_do_accept(l.sock, &buf[0], 512)
 	if C.srt_is_invalid(sock) != 0 {
-		return nil, "", fmt.Errorf("srt_accept : %s", C.GoString(C.srt_getlasterror_str()))
+		return nil, "", fmt.Errorf("srt_accept: %s", C.GoString(C.srt_getlasterror_str()))
 	}
 	return &SRTConn{sock: sock}, C.GoString(&buf[0]), nil
 }
 
-// Close ferme le listener et débloque tout Accept() en attente.
+// Close closes the listener and unblocks any pending Accept().
 func (l *SRTListener) Close() {
 	C.srt_do_close(l.sock)
 }
 
-// SRTConn encapsule une connexion SRT acceptée par SRTListener.
+// SRTConn wraps an SRT connection accepted by SRTListener.
 type SRTConn struct {
 	sock C.SRTSOCKET
 }
 
-// Recv lit le prochain message SRT de la connexion.
-// Retourne (nil, nil) quand la connexion est fermée proprement.
-// Retourne (nil, err) en cas d'erreur.
+// Recv reads the next SRT message from the connection.
+// Returns (nil, nil) when the connection is cleanly closed.
 func (c *SRTConn) Recv() ([]byte, error) {
 	buf := make([]byte, recvBufSize)
 	n := C.srt_do_recv(c.sock, (*C.char)(unsafe.Pointer(&buf[0])), C.int(recvBufSize))
 	if n == 0 {
-		return nil, nil // connexion fermée proprement
+		return nil, nil // connection cleanly closed
 	}
 	if n < 0 {
-		return nil, fmt.Errorf("srt_recvmsg : %s", C.GoString(C.srt_getlasterror_str()))
+		return nil, fmt.Errorf("srt_recvmsg: %s", C.GoString(C.srt_getlasterror_str()))
 	}
 	return buf[:int(n)], nil
 }
 
-// Close ferme la connexion SRT.
+// Close closes the SRT connection.
 func (c *SRTConn) Close() {
 	C.srt_do_close(c.sock)
 }

@@ -29,10 +29,8 @@ func main() {
 	closeLog := logger.Init()
 	defer closeLog()
 
-	// Supprimer les logs internes de pion/WebRTC (très verbeux).
-	// log.SetOutput(io.Discard) coupe le logger standard pour toute la durée du processus.
-	// NE PAS restaurer avec log.SetOutput(os.Stdout) : pion/ICE utilise log.Printf
-	// pour ses messages "Failed to send packet" et "ICE connection state changed".
+	// Silence internal pion/WebRTC logs (very verbose).
+	// log.SetOutput(io.Discard) suppresses the standard logger for the whole process.
 	log.SetOutput(io.Discard)
 	lkprotoLogger.SetLogger(nullLogger{}, "racecast-receiver")
 
@@ -41,7 +39,7 @@ func main() {
 	}
 
 	if cfg.LiveKit.Domain == "" {
-		logger.Fatal("RC_LIVEKIT_DOMAIN non défini")
+		logger.Fatal("RC_LIVEKIT_DOMAIN not set")
 	}
 
 	ensureRoom(cfg)
@@ -58,21 +56,21 @@ func main() {
 	var wg sync.WaitGroup
 	pipeline.RunStreams(ctx, cfg, room, &wg)
 
-	logger.Info("Receiver démarré — port SRT %d. Ctrl+C pour arrêter.", cfg.SRT.Port)
+	logger.Info("Receiver started — SRT port %d. Ctrl+C to stop.", cfg.SRT.Port)
 	<-ctx.Done()
-	logger.Info("Signal reçu — arrêt en cours...")
+	logger.Info("Signal received — shutting down...")
 
 	done := make(chan struct{})
 	go func() { wg.Wait(); close(done) }()
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
-		logger.Warn("Timeout — arrêt forcé")
+		logger.Warn("Timeout — forcing exit")
 	}
-	logger.Info("Arrêt complet.")
+	logger.Info("Shutdown complete.")
 }
 
-// ensureRoom crée la room LiveKit si elle n'existe pas encore.
+// ensureRoom creates the LiveKit room if it does not already exist.
 func ensureRoom(cfg config.Config) {
 	client := lksdk.NewRoomServiceClient(cfg.LiveKit.APIURL(), cfg.LiveKit.APIKey, cfg.LiveKit.APISecret)
 	_, err := client.CreateRoom(context.Background(), &livekit.CreateRoomRequest{
@@ -80,13 +78,13 @@ func ensureRoom(cfg config.Config) {
 		DepartureTimeout: uint32((24 * time.Hour).Seconds()),
 	})
 	if err != nil {
-		logger.Info("[livekit] Room %q déjà existante ou créée", cfg.LiveKit.Room)
+		logger.Info("[livekit] Room %q already exists or created", cfg.LiveKit.Room)
 	} else {
-		logger.Info("[livekit] Room %q créée (DepartureTimeout=24h)", cfg.LiveKit.Room)
+		logger.Info("[livekit] Room %q created (DepartureTimeout=24h)", cfg.LiveKit.Room)
 	}
 }
 
-// connectLiveKit se connecte à la room LiveKit et retourne le client Room.
+// connectLiveKit connects to the LiveKit room and returns the Room client.
 func connectLiveKit(cfg config.Config) (*lksdk.Room, error) {
 	at := lkauth.NewAccessToken(cfg.LiveKit.APIKey, cfg.LiveKit.APISecret)
 	grant := &lkauth.VideoGrant{
@@ -112,11 +110,11 @@ func connectLiveKit(cfg config.Config) (*lksdk.Room, error) {
 		return nil, err
 	}
 
-	logger.Info("[livekit] Connecté à la room %q en tant que %q", cfg.LiveKit.Room, cfg.LiveKit.Identity)
+	logger.Info("[livekit] Connected to room %q as %q", cfg.LiveKit.Room, cfg.LiveKit.Identity)
 	return room, nil
 }
 
-// nullLogger implémente protoLogger.Logger en ignorant tous les messages de pion/WebRTC.
+// nullLogger implements protoLogger.Logger by discarding all pion/WebRTC messages.
 type nullLogger struct{}
 
 func (nullLogger) Debugw(_ string, _ ...any)         {}

@@ -18,10 +18,9 @@ var (
 	currentDate string
 	fileEnabled bool
 
-	// consoleOut est un *os.File ouvert sur un duplicata de fd 1 créé au démarrage
-	// du programme, avant tout appel GStreamer. Quand le package pipeline redirige
-	// temporairement fd 1 vers /dev/null (pour masquer les messages des drivers
-	// Nvidia), consoleOut continue d'écrire sur le terminal d'origine.
+	// consoleOut is a dup of fd 1 created before any GStreamer call.
+	// It keeps writing to the original terminal even when the pipeline package
+	// temporarily redirects fd 1 to /dev/null to silence Nvidia driver noise.
 	consoleOut *os.File
 
 	infoFn  func(string, ...any)
@@ -31,27 +30,26 @@ var (
 )
 
 func init() {
-	// dup(1) crée un nouveau descripteur pointant vers le même terminal que fd 1.
-	// Ce descripteur n'est pas affecté par dup2(/dev/null, 1) appelé plus tard.
+	// dup(1) creates a new fd pointing to the same terminal as fd 1,
+	// unaffected by later dup2(/dev/null, 1) calls.
 	if fd, err := syscall.Dup(int(os.Stdout.Fd())); err == nil {
-		syscall.CloseOnExec(fd) // ne pas hériter dans les processus fils
+		syscall.CloseOnExec(fd) // do not inherit in child processes
 		consoleOut = os.NewFile(uintptr(fd), "stdout")
 	} else {
 		consoleOut = os.Stdout
 	}
 }
 
-// InitConsole initialise le logger en mode console uniquement (pas de fichier).
-// À utiliser pour les commandes interactives comme --ups.
+// InitConsole initializes the logger in console-only mode (no log file).
 func InitConsole() {
 	setup(false)
 }
 
-// Init initialise le logger avec rotation automatique par jour.
-// Retourne une fonction de fermeture à appeler en fin de programme.
+// Init initializes the logger with daily log rotation.
+// Returns a close function to call at program exit.
 func Init() func() {
 	if err := os.MkdirAll(logsDir, 0o755); err != nil {
-		log.Fatalf("Impossible de créer le dossier de logs : %v", err)
+		log.Fatalf("failed to create log directory: %v", err)
 	}
 
 	setup(true)
@@ -63,7 +61,7 @@ func Init() func() {
 	logPath := filepath.Join(logsDir, now.Format("2006-01-02"), "receiver.log")
 	mu.Unlock()
 
-	Info("Logs enregistrés dans %s", logPath)
+	Info("Logging to %s", logPath)
 	return func() {
 		mu.Lock()
 		defer mu.Unlock()
@@ -74,8 +72,8 @@ func Init() func() {
 	}
 }
 
-// rotateIfNeeded ouvre un nouveau fichier de log si la date a changé.
-// Doit être appelé avec mu verrouillé.
+// rotateIfNeeded opens a new log file if the date has changed.
+// Must be called with mu held.
 func rotateIfNeeded(now time.Time) {
 	today := now.Format("2006-01-02")
 	if today == currentDate {
@@ -89,7 +87,7 @@ func rotateIfNeeded(now time.Time) {
 
 	dayDir := filepath.Join(logsDir, today)
 	if err := os.MkdirAll(dayDir, 0o755); err != nil {
-		fmt.Fprintf(consoleOut, "%s | \033[33mWARN \033[0m Impossible de créer %s : %v\n",
+		fmt.Fprintf(consoleOut, "%s | \033[33mWARN \033[0m Failed to create %s: %v\n",
 			now.Format("2006-01-02 15:04:05"), dayDir, err)
 		return
 	}
@@ -97,7 +95,7 @@ func rotateIfNeeded(now time.Time) {
 	logPath := filepath.Join(dayDir, "receiver.log")
 	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
-		fmt.Fprintf(consoleOut, "%s | \033[33mWARN \033[0m Impossible d'ouvrir %s : %v\n",
+		fmt.Fprintf(consoleOut, "%s | \033[33mWARN \033[0m Failed to open %s: %v\n",
 			now.Format("2006-01-02 15:04:05"), logPath, err)
 		return
 	}
@@ -106,8 +104,8 @@ func rotateIfNeeded(now time.Time) {
 	logFile = f
 	currentDate = today
 
-	// Notifier la rotation en cours d'exécution (pas au premier démarrage,
-	// car Init() envoie lui-même le message via Info()).
+	// Notify log rotation at runtime (not on first start,
+	// as Init() sends its own message via Info()).
 	if wasRunning {
 		fmt.Fprintf(consoleOut, "%s | \033[36mINFO \033[0m Rotation des logs → %s\n",
 			now.Format("2006-01-02 15:04:05"), logPath)
