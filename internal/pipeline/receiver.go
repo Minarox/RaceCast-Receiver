@@ -57,25 +57,18 @@ type roomMeta struct {
 	fields map[string]json.RawMessage
 }
 
-// feedbackMsg is the JSON signal sent from the receiver to the emitter when
-// the AV1 decoder pipeline emits a non-fatal bitstream warning.
-// The emitter reacts by forcing an immediate IDR frame on the encoder.
-type feedbackMsg struct {
-	RequestIDR bool `json:"request_idr"`
-}
-
-// connRegistry tracks active SRT video connections and the IDR signal channels
-// of their associated feedback goroutines.
+// connRegistry tracks active SRT video connections and the shared bidirectional
+// telemetry SRT connection used for IDR request signals.
 type connRegistry struct {
-	mu     sync.RWMutex
-	conns  map[string]*SRTConn      // camera name → active SRT video connection
-	idrChs map[string]chan struct{} // camera name → feedback goroutine signal channel
+	mu        sync.RWMutex
+	conns     map[string]*SRTConn // camera name → active SRT video connection
+	telemMu   sync.Mutex
+	telemConn *SRTConn            // shared bidirectional telemetry connection
 }
 
 func newConnRegistry() *connRegistry {
 	return &connRegistry{
-		conns:  make(map[string]*SRTConn),
-		idrChs: make(map[string]chan struct{}),
+		conns: make(map[string]*SRTConn),
 	}
 }
 
@@ -97,32 +90,35 @@ func (r *connRegistry) get(name string) *SRTConn {
 	return r.conns[name]
 }
 
-// setIDRCh registers the channel used by the feedback goroutine for name.
-func (r *connRegistry) setIDRCh(name string, ch chan struct{}) {
-	r.mu.Lock()
-	r.idrChs[name] = ch
-	r.mu.Unlock()
+// setTelemConn stores the active bidirectional telemetry connection.
+func (r *connRegistry) setTelemConn(conn *SRTConn) {
+	r.telemMu.Lock()
+	r.telemConn = conn
+	r.telemMu.Unlock()
 }
 
-// removeIDRCh deregisters the IDR channel when the feedback connection closes.
-func (r *connRegistry) removeIDRCh(name string) {
-	r.mu.Lock()
-	delete(r.idrChs, name)
-	r.mu.Unlock()
+// clearTelemConn removes the telemetry connection reference when it closes.
+func (r *connRegistry) clearTelemConn() {
+	r.telemMu.Lock()
+	r.telemConn = nil
+	r.telemMu.Unlock()
 }
 
-// requestIDR sends a non-blocking IDR signal to the feedback goroutine.
+// requestIDR sends an IDR request to the emitter via the telemetry connection.
 // Called from the GstReceiver decode-warning callback.
 func (r *connRegistry) requestIDR(name string) {
-	r.mu.RLock()
-	ch := r.idrChs[name]
-	r.mu.RUnlock()
-	if ch != nil {
-		select {
-		case ch <- struct{}{}:
-		default: // already pending — ignore duplicate
-		}
+	r.telemMu.Lock()
+	conn := r.telemConn
+	r.telemMu.Unlock()
+	if conn == nil {
+		return
 	}
+	data, _ := json.Marshal(map[string]string{"type": "idr", "camera": name})
+	if err := conn.Send(data); err != nil {
+		logger.Warn("[telemetry] IDR request for %q: %v", name, err)
+		return
+	}
+	logger.Info("[telemetry] IDR request sent for camera %q (decode warning)", name)
 }
 
 // update stores data for the given key and returns the merged JSON.
@@ -200,20 +196,13 @@ func RunStreams(ctx context.Context, cfg config.Config, room *lksdk.Room, wg *sy
 			}
 			name, source := parseStreamID(streamID)
 			wg.Add(1)
-			switch source {
-			case "ups", "modem":
-				logger.Info("[telemetry:%s] Incoming connection", source)
-				go func(src string) {
+			if name == "telemetry" {
+				logger.Info("[telemetry] Incoming bidirectional connection")
+				go func() {
 					defer wg.Done()
-					runTelemetry(ctx, conn, src, cfg, meta)
-				}(source)
-			case "feedback":
-				logger.Info("[feedback:%s] Incoming feedback connection", name)
-				go func(n string) {
-					defer wg.Done()
-					runFeedback(ctx, conn, n, registry)
-				}(name)
-			default:
+					runBiTelemetry(ctx, conn, cfg, meta, registry)
+				}()
+			} else {
 				mediaType := mediaTypeFromSource(source)
 				logger.Info("[stream:%s] Incoming connection (streamid=%q, type=%s)", name, streamID, mediaType)
 				go func(n, s, mt string) {
@@ -324,32 +313,47 @@ loop:
 	recv.Free()
 }
 
-// runTelemetry reads JSON messages from a telemetry SRT connection and updates
-// LiveKit room metadata on each message. key identifies the stream ("ups", "modem", ...);
-// data is merged into meta before sending so streams don't overwrite each other.
-func runTelemetry(ctx context.Context, conn *SRTConn, key string, cfg config.Config, meta *roomMeta) {
+// runBiTelemetry handles the single bidirectional SRT telemetry connection.
+// Incoming messages are typed envelopes routed by the "type" field:
+//   - "ups" / "modem" → inner "data" merged into LiveKit room metadata.
+//
+// Outgoing: IDR request signals {"type":"idr","camera":"..."} sent via
+// registry.requestIDR when a GstReceiver decode-warning fires.
+func runBiTelemetry(ctx context.Context, conn *SRTConn, cfg config.Config, meta *roomMeta, registry *connRegistry) {
+	registry.setTelemConn(conn)
+	defer registry.clearTelemConn()
 	defer conn.Close()
+
 	client := lksdk.NewRoomServiceClient(cfg.LiveKit.APIURL(), cfg.LiveKit.APIKey, cfg.LiveKit.APISecret)
+	logger.Info("[telemetry] Bidirectional connection established")
 
 	for {
 		data, err := conn.Recv()
 		if err != nil || data == nil {
-			logger.Info("[telemetry:%s] Connection closed", key)
+			logger.Info("[telemetry] Connection closed")
 			return
 		}
 
-		if !json.Valid(data) {
-			logger.Warn("[telemetry:%s] Non-JSON message ignored", key)
+		var envelope struct {
+			Type string          `json:"type"`
+			Data json.RawMessage `json:"data"`
+		}
+		if err := json.Unmarshal(data, &envelope); err != nil || envelope.Type == "" {
+			logger.Warn("[telemetry] Unrecognised message ignored")
 			continue
 		}
 
-		merged := meta.update(key, json.RawMessage(data))
-
-		if _, err := client.UpdateRoomMetadata(ctx, &lkproto.UpdateRoomMetadataRequest{
-			Room:     cfg.LiveKit.Room,
-			Metadata: merged,
-		}); err != nil && ctx.Err() == nil {
-			logger.Warn("[telemetry:%s] UpdateRoom : %v", key, err)
+		switch envelope.Type {
+		case "ups", "modem":
+			merged := meta.update(envelope.Type, envelope.Data)
+			if _, err := client.UpdateRoomMetadata(ctx, &lkproto.UpdateRoomMetadataRequest{
+				Room:     cfg.LiveKit.Room,
+				Metadata: merged,
+			}); err != nil && ctx.Err() == nil {
+				logger.Warn("[telemetry:%s] UpdateRoom: %v", envelope.Type, err)
+			}
+		default:
+			logger.Warn("[telemetry] Unknown message type %q", envelope.Type)
 		}
 	}
 }
@@ -431,35 +435,5 @@ func trackSource(s string) lkproto.TrackSource {
 		return lkproto.TrackSource_MICROPHONE
 	default:
 		return lkproto.TrackSource_CAMERA
-	}
-}
-
-// runFeedback listens for IDR request signals from the emitter's receiver-side
-// decode-warning callback. It is event-driven: a message is only sent when the
-// GstReceiver pipeline emits a non-fatal AV1 bitstream warning, so no
-// periodic polling or network stats round-trip is needed.
-func runFeedback(ctx context.Context, conn *SRTConn, cameraName string, registry *connRegistry) {
-	defer conn.Close()
-
-	// Create a buffered channel (capacity 1) so duplicate rapid warnings coalesce.
-	idrCh := make(chan struct{}, 1)
-	registry.setIDRCh(cameraName, idrCh)
-	defer registry.removeIDRCh(cameraName)
-
-	logger.Info("[feedback:%s] IDR request listener active", cameraName)
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-idrCh:
-			msg := feedbackMsg{RequestIDR: true}
-			data, _ := json.Marshal(msg)
-			if err := conn.Send(data); err != nil {
-				logger.Warn("[feedback:%s] Send failed: %v", cameraName, err)
-				return
-			}
-			logger.Info("[feedback:%s] IDR request sent to emitter (decode warning)", cameraName)
-		}
 	}
 }
