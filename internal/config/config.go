@@ -44,7 +44,7 @@ func (c LiveKitConfig) APIURL() string {
 // stream type is determined from the SRT streamid ("name:source").
 type SRTConfig struct {
 	Port    int // RC_SRT_PORT: listen port
-	Latency int // RC_SRT_LATENCY in ms (default 2000)
+	Latency int // RC_SRT_LATENCY in ms (default 800)
 }
 
 // Load reads configuration from environment variables.

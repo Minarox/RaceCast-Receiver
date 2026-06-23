@@ -179,6 +179,10 @@ func (m *roomMeta) buildJSON() string {
 		fmt.Fprintf(&sb, "%q:%s", k, m.fields[k])
 		first = false
 	}
+	if !first {
+		sb.WriteByte(',')
+	}
+	fmt.Fprintf(&sb, `"updated_at":%d`, time.Now().Unix())
 	sb.WriteByte('}')
 	return sb.String()
 }
@@ -253,24 +257,26 @@ func runStream(ctx context.Context, conn *SRTConn, name, source, mediaType strin
 		return
 	}
 
+	// Publish the LiveKit track immediately so subscribers can discover it and
+	// begin ICE/DTLS setup while the GStreamer pipeline is still initialising.
+	track, pub, err := publishTrack(name, mediaType, source, room)
+	if err != nil {
+		logger.Error("[stream:%s] PublishTrack: %v", name, err)
+		conn.Close()
+		return
+	}
+
 	recv, err := newGstReceiver(pipelineStr)
 	if err != nil {
 		logger.Error("[stream:%s] Pipeline creation: %v", name, err)
+		_ = room.LocalParticipant.UnpublishTrack(pub.SID())
 		conn.Close()
 		return
 	}
 	if err := recv.Start(); err != nil {
 		logger.Error("[stream:%s] Pipeline start: %v", name, err)
 		recv.Free()
-		conn.Close()
-		return
-	}
-
-	track, pub, err := publishTrack(name, mediaType, source, room)
-	if err != nil {
-		logger.Error("[stream:%s] PublishTrack: %v", name, err)
-		recv.Stop()
-		recv.Free()
+		_ = room.LocalParticipant.UnpublishTrack(pub.SID())
 		conn.Close()
 		return
 	}
