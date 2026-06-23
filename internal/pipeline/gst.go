@@ -25,14 +25,18 @@ package pipeline
 //     gst_app_src_end_of_stream(GST_APP_SRC(src));
 // }
 //
-// // Sets the pipeline to PLAYING and waits for async state change to complete.
+// // Sets the pipeline to PLAYING and returns immediately.
 // // Returns 1 on success, 0 on failure.
+// // NOTE: do NOT wait for ASYNC completion here. The pipeline contains
+// // av1parse (a GstBaseParse element) which reports ASYNC even when the
+// // upstream appsrc is is-live=true, because GstBaseParse needs to see the
+// // first OBU_SEQUENCE_HEADER before it can determine caps. The SRT data-push
+// // goroutine starts only after Start() returns, so blocking here starves
+// // av1parse of data and the 30-second timeout fires before a single frame
+// // is decoded — producing exactly 30 s of video startup latency. Accept ASYNC
+// // immediately; the pipeline prerolls in the background as soon as data flows.
 // static int start_pipeline(GstElement *pipeline) {
 //     GstStateChangeReturn ret = gst_element_set_state(pipeline, GST_STATE_PLAYING);
-//     if (ret == GST_STATE_CHANGE_ASYNC) {
-//         GstState state;
-//         ret = gst_element_get_state(pipeline, &state, NULL, 30 * GST_SECOND);
-//     }
 //     return ret != GST_STATE_CHANGE_FAILURE ? 1 : 0;
 // }
 //
