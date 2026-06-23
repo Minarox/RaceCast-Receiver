@@ -1,15 +1,9 @@
 package pipeline
 
-// receiver.go orchestrates the single SRT listener and LiveKit publishing.
-//
-// Architecture:
-//   - One SRT socket listening on cfg.SRT.Port.
-//   - Each incoming connection returns its streamid ("name:source") during
-//     the SRT handshake — the stream type is known immediately.
-//   - One goroutine per connection: SRT recv → appsrc → GStreamer → appsink
-//     → LiveKit WriteSample.
-//   - The Jetson sends all streams in caller mode on the same port;
-//     discrimination is done solely by streamid.
+// receiver.go orchestrates the SRT listener and LiveKit publishing.
+// One SRT socket on cfg.SRT.Port; each connection's streamid ("name:source")
+// is known at handshake. One goroutine per connection: SRT recv → appsrc →
+// GStreamer → appsink → LiveKit WriteSample.
 
 import (
 	"context"
@@ -29,11 +23,8 @@ import (
 	"racecast-receiver/internal/logger"
 )
 
-// buildVideoPipeline builds the GStreamer pipeline to decode raw AV1 OBU.
-//
-// The Jetson sends raw AV1 OBU stream (nvv4l2av1enc → av1parse → srtsink).
-// Bytes are injected into appsrc; av1parse re-syncs and aligns on temporal
-// units (alignment=tu) — each appsink buffer = one complete AV1 frame.
+// buildVideoPipeline decodes a raw AV1 OBU stream injected via appsrc.
+// av1parse aligns on temporal units (alignment=tu): one buffer = one AV1 frame.
 func buildVideoPipeline() string {
 	return `appsrc name=src caps="video/x-av1,stream-format=obu-stream" ` +
 		`format=bytes is-live=true ! ` +
@@ -41,10 +32,8 @@ func buildVideoPipeline() string {
 		`appsink name=sink max-buffers=4 drop=true sync=false`
 }
 
-// buildAudioPipeline builds the GStreamer pipeline to receive raw Opus.
-//
-// The Jetson sends raw Opus frames (opusenc → srtsink).
-// SRT is message-oriented: each srt_recvmsg = one GStreamer buffer = one Opus frame.
+// buildAudioPipeline receives raw Opus frames injected via appsrc.
+// SRT is message-oriented: each srt_recvmsg = one buffer = one Opus frame.
 func buildAudioPipeline() string {
 	return `appsrc name=src caps="audio/x-opus,rate=48000,channels=2" ` +
 		`format=bytes is-live=true ! ` +
@@ -52,11 +41,8 @@ func buildAudioPipeline() string {
 		`appsink name=sink max-buffers=16 drop=true sync=false`
 }
 
-// roomMeta keeps the latest data from each telemetry stream.
-// It merges ups, modem and GPS into a single JSON object sent to LiveKit.
-// Updates are accumulated in memory; snapshot() drains dirty state for flushing.
-// notify is signalled (non-blocking) whenever a field changes; the flush goroutine
-// in runBiTelemetry reads from it to trigger an immediate LiveKit push.
+// roomMeta accumulates telemetry data from multiple streams into one JSON object
+// pushed to LiveKit. snapshot() drains dirty state; notify is signalled on each update.
 type roomMeta struct {
 	mu     sync.Mutex
 	fields map[string]json.RawMessage
@@ -69,7 +55,7 @@ func newRoomMeta() *roomMeta {
 }
 
 // connRegistry tracks active SRT video connections and the shared bidirectional
-// telemetry SRT connection used for IDR request signals.
+// telemetry connection for IDR requests.
 type connRegistry struct {
 	mu        sync.RWMutex
 	conns     map[string]*SRTConn // camera name → active SRT video connection
@@ -133,8 +119,7 @@ func (r *connRegistry) requestIDR(name string) {
 }
 
 // update stores data for the given key and signals the flush goroutine.
-// The notification is non-blocking: if a flush is already pending, the new data
-// will be included when snapshot() is called next.
+	// Non-blocking: if a flush is already pending, data is picked up on next snapshot().
 func (m *roomMeta) update(key string, data json.RawMessage) {
 	m.mu.Lock()
 	if m.fields == nil {
@@ -253,12 +238,8 @@ func RunStreams(ctx context.Context, cfg config.Config, room *lksdk.Room, wg *sy
 	}()
 }
 
-// runStream handles a complete lifecycle for an accepted SRT connection:
-//  1. Create and start the GStreamer pipeline (appsrc → … → appsink).
-//  2. Publish the LiveKit track immediately (type known from streamid).
-//  3. SRT goroutine: recv → Push() into appsrc.
-//  4. Main loop: Frames() → LiveKit WriteSample.
-//  5. On connection close or EOS: unpublish, Stop, Free.
+// runStream handles a complete SRT connection lifecycle:
+// create GStreamer pipeline, publish LiveKit track, relay SRT → appsrc → LiveKit.
 func runStream(ctx context.Context, conn *SRTConn, name, source, mediaType string, room *lksdk.Room, registry *connRegistry) {
 	var pipelineStr string
 	switch mediaType {
@@ -352,18 +333,10 @@ loop:
 	recv.Free()
 }
 
-// runBiTelemetry handles the single bidirectional SRT telemetry connection.
-// Incoming messages are typed envelopes routed by the "type" field:
-//   - "ups" / "modem" → inner "data" merged into LiveKit room metadata.
-//
-// Flush strategy — leading-edge throttle with 1 s cooldown:
-//   1. A telemetry packet arrives → update the aggregated state immediately.
-//   2. If no flush is in cooldown → push to LiveKit now and start a 1 s window.
-//   3. Further packets during the window → update state only (no API call).
-//   4. When the window expires → if new data accumulated, push and restart the window.
-//
-// Outgoing: IDR request signals {"type":"idr","camera":"..."} sent via
-// registry.requestIDR when a GstReceiver decode-warning fires.
+// runBiTelemetry handles the bidirectional SRT telemetry connection.
+// Incoming: typed envelopes routed by "type" ("ups"/"modem" → LiveKit metadata).
+// Flush: leading-edge throttle, 1 s cooldown.
+// Outgoing: IDR requests via registry.requestIDR on GstReceiver decode-warning.
 func runBiTelemetry(ctx context.Context, conn *SRTConn, cfg config.Config, meta *roomMeta, registry *connRegistry) {
 	registry.setTelemConn(conn)
 	defer registry.clearTelemConn()
@@ -386,10 +359,7 @@ func runBiTelemetry(ctx context.Context, conn *SRTConn, cfg config.Config, meta 
 		}
 	}
 
-	// Flush goroutine: leading-edge throttle with 1 s cooldown.
-	// Each token in meta.notify triggers an immediate flush followed by a 1 s
-	// cooldown. Tokens that arrive during the cooldown are buffered (channel
-	// capacity = 1) and cause a trailing flush once the window expires.
+	// Flush goroutine: leading-edge throttle, 1 s cooldown between LiveKit pushes.
 	const cooldown = time.Second
 	go func() {
 		for {

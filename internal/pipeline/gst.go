@@ -1,10 +1,7 @@
 package pipeline
 
-// gst.go manages GStreamer appsrc→…→appsink pipelines used to decode
-// AV1 and Opus streams received via libsrt (listener.go).
-//
-// Data arrives via Push() into the "src" appsrc.
-// Decoded frames are read by the consumer via Frames().
+// gst.go manages GStreamer appsrc→…→appsink pipelines for AV1/Opus decoding.
+// Data arrives via Push() into "src" appsrc; decoded frames are read via Frames().
 
 // #cgo pkg-config: gstreamer-1.0 gstreamer-app-1.0
 // #include <gst/gst.h>
@@ -198,9 +195,8 @@ func newGstReceiver(pipelineStr string) (*GstReceiver, error) {
 	}, nil
 }
 
-// SetOnDecodeWarning registers a callback invoked when the GStreamer pipeline
-// emits a non-fatal warning (e.g., corrupted AV1 bitstream). The callback is
-// called in a separate goroutine and used to trigger IDR requests.
+// SetOnDecodeWarning registers a callback for non-fatal GStreamer warnings
+// (e.g. corrupted AV1 bitstream), used to trigger IDR requests.
 func (r *GstReceiver) SetOnDecodeWarning(fn func()) {
 	r.mu.Lock()
 	r.onDecodeWarning = fn

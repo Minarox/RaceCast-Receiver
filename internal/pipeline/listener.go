@@ -1,10 +1,8 @@
 package pipeline
 
-// listener.go implements a multi-connection SRT listener via libsrt directly.
-//
-// Unlike srtsrc GStreamer (one connection per element), this listener accepts
-// N simultaneous connections on a single port, routing by SRT streamid.
-// Each accepted connection returns its streamid immediately during the handshake.
+// listener.go implements a multi-connection SRT listener via libsrt.
+// Unlike srtsrc (one element per connection), this listener accepts N connections
+// on a single port, routing by SRT streamid read at handshake.
 
 // #cgo pkg-config: srt
 // #include <srt/srt.h>
@@ -105,9 +103,8 @@ import (
 	"unsafe"
 )
 
-// recvBufSize is the maximum SRT message size.
-// SRT guarantees srt_recvmsg returns a complete message.
-const recvBufSize = 1500 * 7 // ~10 KB, well above a single AV1/Opus frame
+// recvBufSize is the max SRT message size (~10 KB, well above one AV1/Opus frame).
+const recvBufSize = 1500 * 7
 
 // SRTListener wraps an SRT socket in listener mode (single port, N connections).
 type SRTListener struct {
@@ -115,9 +112,7 @@ type SRTListener struct {
 }
 
 // newSRTListener creates a dual-stack SRT listener on the given port.
-// latency is the SRT latency in milliseconds, inherited by incoming connections.
-// The passphrase is read from RC_SRT_PASSPHRASE; if set, AES-256 is required
-// on every incoming connection — connections with the wrong key are rejected.
+// Passphrase from RC_SRT_PASSPHRASE; if set, AES-256 is required on all connections.
 func newSRTListener(port, latency int) (*SRTListener, error) {
 	passphrase := strings.TrimSpace(os.Getenv("RC_SRT_PASSPHRASE"))
 	cPass := C.CString(passphrase)
@@ -170,9 +165,7 @@ func (c *SRTConn) Close() {
 	C.srt_do_close(c.sock)
 }
 
-// Send sends data to the emitter via this SRT connection.
-// SRT connections are bidirectional; the accepted socket can write back to
-// the caller (emitter) using srt_sendmsg.
+// Send sends data to the emitter (SRT connections are bidirectional).
 func (c *SRTConn) Send(data []byte) error {
 	if len(data) == 0 {
 		return nil
@@ -184,8 +177,7 @@ func (c *SRTConn) Send(data []byte) error {
 	return nil
 }
 
-// Stats returns the packet-loss percentage, RTT (ms) and estimated bandwidth
-// (Mbps) measured since the last call (interval stats, auto-cleared).
+// Stats returns interval packet-loss (%), RTT (ms) and bandwidth (Mbps); auto-cleared.
 func (c *SRTConn) Stats() (lossPct, rttMS, bandwidthMbps float64) {
 	var lp, rtt, bw C.double
 	C.srt_get_stats(c.sock, &lp, &rtt, &bw)

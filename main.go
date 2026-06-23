@@ -29,8 +29,7 @@ func main() {
 	closeLog := logger.Init()
 	defer closeLog()
 
-	// Silence internal pion/WebRTC logs (very verbose).
-	// log.SetOutput(io.Discard) suppresses the standard logger for the whole process.
+	// Silence pion/WebRTC internal logs (very verbose).
 	log.SetOutput(io.Discard)
 	lkprotoLogger.SetLogger(nullLogger{}, "racecast-receiver")
 
@@ -114,7 +113,7 @@ func connectLiveKit(cfg config.Config) (*lksdk.Room, error) {
 	return room, nil
 }
 
-// nullLogger implements protoLogger.Logger by discarding all pion/WebRTC messages.
+// nullLogger discards all pion/WebRTC log output.
 type nullLogger struct{}
 
 func (nullLogger) Debugw(_ string, _ ...any)         {}
