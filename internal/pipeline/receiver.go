@@ -15,8 +15,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	lkproto "github.com/livekit/protocol/livekit"
 	lksdk "github.com/livekit/server-sdk-go/v2"
@@ -51,10 +53,19 @@ func buildAudioPipeline() string {
 }
 
 // roomMeta keeps the latest data from each telemetry stream.
-// It merges ups and modem into a single JSON object sent to LiveKit.
+// It merges ups, modem and GPS into a single JSON object sent to LiveKit.
+// Updates are accumulated in memory; snapshot() drains dirty state for flushing.
+// notify is signalled (non-blocking) whenever a field changes; the flush goroutine
+// in runBiTelemetry reads from it to trigger an immediate LiveKit push.
 type roomMeta struct {
-	mu    sync.Mutex
+	mu     sync.Mutex
 	fields map[string]json.RawMessage
+	dirty  bool
+	notify chan struct{} // buffered(1): at most one pending flush signal
+}
+
+func newRoomMeta() *roomMeta {
+	return &roomMeta{notify: make(chan struct{}, 1)}
 }
 
 // connRegistry tracks active SRT video connections and the shared bidirectional
@@ -121,15 +132,38 @@ func (r *connRegistry) requestIDR(name string) {
 	logger.Info("[telemetry] IDR request sent for camera %q (decode warning)", name)
 }
 
-// update stores data for the given key and returns the merged JSON.
-func (m *roomMeta) update(key string, data json.RawMessage) string {
+// update stores data for the given key and signals the flush goroutine.
+// The notification is non-blocking: if a flush is already pending, the new data
+// will be included when snapshot() is called next.
+func (m *roomMeta) update(key string, data json.RawMessage) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if m.fields == nil {
 		m.fields = make(map[string]json.RawMessage)
 	}
 	m.fields[key] = data
-	// Build merged JSON preserving order: ups, modem, then others.
+	m.dirty = true
+	m.mu.Unlock()
+	select {
+	case m.notify <- struct{}{}:
+	default: // a flush is already scheduled; data will be picked up by snapshot()
+	}
+}
+
+// snapshot returns the merged JSON string and resets the dirty flag.
+// Returns ("", false) when no update has occurred since the last snapshot.
+func (m *roomMeta) snapshot() (string, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.dirty {
+		return "", false
+	}
+	m.dirty = false
+	return m.buildJSON(), true
+}
+
+// buildJSON serialises m.fields to a JSON object. mu must be held.
+func (m *roomMeta) buildJSON() string {
+	// Build merged JSON preserving order: ups, modem, then others (sorted).
 	order := []string{"ups", "modem"}
 	seen := make(map[string]bool, len(order))
 	var sb strings.Builder
@@ -145,14 +179,19 @@ func (m *roomMeta) update(key string, data json.RawMessage) string {
 			seen[k] = true
 		}
 	}
-	for k, v := range m.fields {
-		if seen[k] {
-			continue
+	// Collect and sort any remaining keys for deterministic JSON output.
+	var extra []string
+	for k := range m.fields {
+		if !seen[k] {
+			extra = append(extra, k)
 		}
+	}
+	sort.Strings(extra)
+	for _, k := range extra {
 		if !first {
 			sb.WriteByte(',')
 		}
-		fmt.Fprintf(&sb, "%q:%s", k, v)
+		fmt.Fprintf(&sb, "%q:%s", k, m.fields[k])
 		first = false
 	}
 	sb.WriteByte('}')
@@ -176,7 +215,7 @@ func RunStreams(ctx context.Context, cfg config.Config, room *lksdk.Room, wg *sy
 	logger.Info("[srt] Listener started on port %d (latency=%d ms)", cfg.SRT.Port, cfg.SRT.Latency)
 
 	// Shared state to merge telemetry streams into a single JSON object.
-	meta := &roomMeta{}
+	meta := newRoomMeta()
 
 	// Registry of active SRT video connections indexed by camera name.
 	// Used by feedback goroutines to read per-stream SRT statistics.
@@ -317,6 +356,12 @@ loop:
 // Incoming messages are typed envelopes routed by the "type" field:
 //   - "ups" / "modem" → inner "data" merged into LiveKit room metadata.
 //
+// Flush strategy — leading-edge throttle with 1 s cooldown:
+//   1. A telemetry packet arrives → update the aggregated state immediately.
+//   2. If no flush is in cooldown → push to LiveKit now and start a 1 s window.
+//   3. Further packets during the window → update state only (no API call).
+//   4. When the window expires → if new data accumulated, push and restart the window.
+//
 // Outgoing: IDR request signals {"type":"idr","camera":"..."} sent via
 // registry.requestIDR when a GstReceiver decode-warning fires.
 func runBiTelemetry(ctx context.Context, conn *SRTConn, cfg config.Config, meta *roomMeta, registry *connRegistry) {
@@ -326,6 +371,42 @@ func runBiTelemetry(ctx context.Context, conn *SRTConn, cfg config.Config, meta 
 
 	client := lksdk.NewRoomServiceClient(cfg.LiveKit.APIURL(), cfg.LiveKit.APIKey, cfg.LiveKit.APISecret)
 	logger.Info("[telemetry] Bidirectional connection established")
+
+	// flush pushes the current aggregated state to LiveKit.
+	flush := func() {
+		merged, ok := meta.snapshot()
+		if !ok {
+			return
+		}
+		if _, err := client.UpdateRoomMetadata(ctx, &lkproto.UpdateRoomMetadataRequest{
+			Room:     cfg.LiveKit.Room,
+			Metadata: merged,
+		}); err != nil && ctx.Err() == nil {
+			logger.Warn("[telemetry] UpdateRoom: %v", err)
+		}
+	}
+
+	// Flush goroutine: leading-edge throttle with 1 s cooldown.
+	// Each token in meta.notify triggers an immediate flush followed by a 1 s
+	// cooldown. Tokens that arrive during the cooldown are buffered (channel
+	// capacity = 1) and cause a trailing flush once the window expires.
+	const cooldown = time.Second
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-meta.notify:
+				flush()
+				// Cooldown: accumulate data for up to 1 s before the next push.
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(cooldown):
+				}
+			}
+		}
+	}()
 
 	for {
 		data, err := conn.Recv()
@@ -345,13 +426,7 @@ func runBiTelemetry(ctx context.Context, conn *SRTConn, cfg config.Config, meta 
 
 		switch envelope.Type {
 		case "ups", "modem":
-			merged := meta.update(envelope.Type, envelope.Data)
-			if _, err := client.UpdateRoomMetadata(ctx, &lkproto.UpdateRoomMetadataRequest{
-				Room:     cfg.LiveKit.Room,
-				Metadata: merged,
-			}); err != nil && ctx.Err() == nil {
-				logger.Warn("[telemetry:%s] UpdateRoom: %v", envelope.Type, err)
-			}
+			meta.update(envelope.Type, envelope.Data)
 		default:
 			logger.Warn("[telemetry] Unknown message type %q", envelope.Type)
 		}
