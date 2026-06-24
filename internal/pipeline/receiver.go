@@ -9,7 +9,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -115,11 +117,30 @@ func (r *connRegistry) requestIDR(name string) {
 		logger.Warn("[telemetry] IDR request for %q: %v", name, err)
 		return
 	}
-	logger.Info("[telemetry] IDR request sent for camera %q (decode warning)", name)
+	logger.Info("[telemetry] IDR request sent for camera %q", name)
+}
+
+// streamSlot tracks an active stream goroutine. The Accept loop sends reconnect
+// connections into reconn so runStream can resume without destroying the
+// LiveKit track.
+type streamSlot struct {
+	reconn chan *SRTConn // buffered(1)
+}
+
+// reconnGraceTimeout is how long runStream keeps the LiveKit track alive and
+// waits for the emitter to reconnect after an SRT disconnection.
+// Configurable via RC_SRT_RECONNECT_GRACE (seconds, default 5).
+func reconnGraceTimeout() time.Duration {
+	if s := os.Getenv("RC_SRT_RECONNECT_GRACE"); s != "" {
+		if v, err := strconv.Atoi(s); err == nil && v > 0 {
+			return time.Duration(v) * time.Second
+		}
+	}
+	return 5 * time.Second
 }
 
 // update stores data for the given key and signals the flush goroutine.
-	// Non-blocking: if a flush is already pending, data is picked up on next snapshot().
+// Non-blocking: if a flush is already pending, data is picked up on next snapshot().
 func (m *roomMeta) update(key string, data json.RawMessage) {
 	m.mu.Lock()
 	if m.fields == nil {
@@ -188,27 +209,27 @@ func (m *roomMeta) buildJSON() string {
 }
 
 // RunStreams starts an SRT listener on cfg.SRT.Port and accepts all incoming
-// connections, each handled in its own goroutine.
+// connections. When the emitter reconnects with the same streamid, the new
+// connection is routed to the existing runStream goroutine via a streamSlot
+// channel instead of starting a new one.
 func RunStreams(ctx context.Context, cfg config.Config, room *lksdk.Room, wg *sync.WaitGroup) {
 	listener, err := newSRTListener(cfg.SRT.Port, cfg.SRT.Latency)
 	if err != nil {
 		logger.Fatal("[srt] Listener port %d: %v", cfg.SRT.Port, err)
 	}
-
-	// Close the listener when ctx is cancelled (unblocks Accept).
 	go func() {
 		<-ctx.Done()
 		listener.Close()
 	}()
-
 	logger.Info("[srt] Listener started on port %d (latency=%d ms)", cfg.SRT.Port, cfg.SRT.Latency)
 
-	// Shared state to merge telemetry streams into a single JSON object.
 	meta := newRoomMeta()
-
-	// Registry of active SRT video connections indexed by camera name.
-	// Used by feedback goroutines to read per-stream SRT statistics.
 	registry := newConnRegistry()
+
+	var (
+		slotsMu sync.Mutex
+		slots   = make(map[string]*streamSlot)
+	)
 
 	wg.Add(1)
 	go func() {
@@ -217,34 +238,66 @@ func RunStreams(ctx context.Context, cfg config.Config, room *lksdk.Room, wg *sy
 			conn, streamID, err := listener.Accept()
 			if err != nil {
 				if ctx.Err() != nil {
-					return // clean shutdown
+					return
 				}
 				logger.Error("[srt] Accept: %v — retrying...", err)
 				continue
 			}
+
 			name, source := parseStreamID(streamID)
-			wg.Add(1)
+
 			if name == "telemetry" {
 				logger.Info("[telemetry] Incoming bidirectional connection")
+				wg.Add(1)
 				go func() {
 					defer wg.Done()
 					runBiTelemetry(ctx, conn, cfg, meta, registry)
 				}()
-			} else {
-				mediaType := mediaTypeFromSource(source)
-				logger.Info("[stream:%s] Incoming connection (streamid=%q, type=%s)", name, streamID, mediaType)
-				go func(n, s, mt string) {
-					defer wg.Done()
-					runStream(ctx, conn, n, s, mt, room, registry)
-				}(name, source, mediaType)
+				continue
 			}
+
+			mediaType := mediaTypeFromSource(source)
+			logger.Info("[stream:%s] Incoming connection (streamid=%q, type=%s)", name, streamID, mediaType)
+
+			// Route reconnection to the existing goroutine, or start a new one.
+			slotsMu.Lock()
+			sl := slots[name]
+			if sl != nil {
+				slotsMu.Unlock()
+				select {
+				case sl.reconn <- conn:
+					logger.Info("[stream:%s] Reconnection queued", name)
+				default:
+					logger.Warn("[stream:%s] Reconnect channel busy — closing connection", name)
+					conn.Close()
+				}
+				continue
+			}
+			sl = &streamSlot{reconn: make(chan *SRTConn, 1)}
+			slots[name] = sl
+			slotsMu.Unlock()
+
+			wg.Add(1)
+			go func(n, s, mt string, sl *streamSlot, c *SRTConn) {
+				defer wg.Done()
+				defer func() {
+					slotsMu.Lock()
+					delete(slots, n)
+					slotsMu.Unlock()
+				}()
+				runStream(ctx, c, sl.reconn, n, s, mt, room, registry)
+			}(name, source, mediaType, sl, conn)
 		}
 	}()
 }
 
-// runStream handles a complete SRT connection lifecycle:
-// create GStreamer pipeline, publish LiveKit track, relay SRT → appsrc → LiveKit.
-func runStream(ctx context.Context, conn *SRTConn, name, source, mediaType string, room *lksdk.Room, registry *connRegistry) {
+// runStream handles an SRT stream's full lifecycle, including reconnections.
+// It publishes one LiveKit track (once) and loops: receive SRT data → push to
+// GStreamer → send frames to LiveKit. On SRT disconnection, it waits up to
+// reconnGraceTimeout() for the emitter to reconnect before unpublishing.
+func runStream(ctx context.Context, firstConn *SRTConn, reconn <-chan *SRTConn,
+	name, source, mediaType string, room *lksdk.Room, registry *connRegistry) {
+
 	var pipelineStr string
 	switch mediaType {
 	case "video":
@@ -253,90 +306,139 @@ func runStream(ctx context.Context, conn *SRTConn, name, source, mediaType strin
 		pipelineStr = buildAudioPipeline()
 	default:
 		logger.Error("[stream:%s] Unknown media type: %q — closing connection", name, mediaType)
-		conn.Close()
+		firstConn.Close()
 		return
 	}
 
-	// Publish the LiveKit track immediately so subscribers can discover it and
-	// begin ICE/DTLS setup while the GStreamer pipeline is still initialising.
+	// Publish the LiveKit track immediately; it persists across reconnections.
 	track, pub, err := publishTrack(name, mediaType, source, room)
 	if err != nil {
 		logger.Error("[stream:%s] PublishTrack: %v", name, err)
-		conn.Close()
+		firstConn.Close()
 		return
 	}
-
-	recv, err := newGstReceiver(pipelineStr)
-	if err != nil {
-		logger.Error("[stream:%s] Pipeline creation: %v", name, err)
-		_ = room.LocalParticipant.UnpublishTrack(pub.SID())
-		conn.Close()
-		return
-	}
-	if err := recv.Start(); err != nil {
-		logger.Error("[stream:%s] Pipeline start: %v", name, err)
-		recv.Free()
-		_ = room.LocalParticipant.UnpublishTrack(pub.SID())
-		conn.Close()
-		return
-	}
-
-	// Register connection so the feedback goroutine can poll SRT stats.
-	registry.register(name, conn)
-	defer registry.unregister(name)
-
-	// Forward GStreamer AV1 decode warnings as IDR requests to the emitter.
-	if mediaType == "video" {
-		recv.SetOnDecodeWarning(func() { registry.requestIDR(name) })
-	}
-
-	// SRT → appsrc goroutine. Owns conn and closes it when done.
-	recvDone := make(chan struct{})
-	go func() {
-		defer close(recvDone)
-		defer conn.Close()
-		for {
-			data, recvErr := conn.Recv()
-			if recvErr != nil || data == nil {
-				recv.EndOfStream()
-				return
-			}
-			if pushErr := recv.Push(data); pushErr != nil {
-				logger.Warn("[stream:%s] Push appsrc : %v", name, pushErr)
-				recv.EndOfStream()
-				return
-			}
+	defer func() {
+		if pub != nil {
+			_ = room.LocalParticipant.UnpublishTrack(pub.SID())
+			logger.Info("[stream:%s] Track removed from LiveKit", name)
 		}
 	}()
 
-	// Main loop: appsink → LiveKit WriteSample.
-loop:
+	grace := reconnGraceTimeout()
+	conn := firstConn
+
+streamLoop:
 	for {
-		select {
-		case <-ctx.Done():
-			conn.Close()  // unblocks the SRT receive goroutine
-			<-recvDone
-			break loop
-		case f, ok := <-recv.Frames():
-			if !ok {
-				<-recvDone
-				break loop
+		// Register before creating the pipeline so IDR requests and stats
+		// polling can find the connection from the first moment.
+		registry.register(name, conn)
+
+		recv, err := newGstReceiver(pipelineStr)
+		if err != nil {
+			logger.Error("[stream:%s] Pipeline creation: %v", name, err)
+			conn.Close()
+			registry.unregister(name)
+			return
+		}
+		if err := recv.Start(); err != nil {
+			logger.Error("[stream:%s] Pipeline start: %v", name, err)
+			recv.Free()
+			conn.Close()
+			registry.unregister(name)
+			return
+		}
+
+		if mediaType == "video" {
+			// Forward bitstream warnings as IDR requests to the emitter.
+			recv.SetOnDecodeWarning(func() { registry.requestIDR(name) })
+			// Request a keyframe immediately so the stream starts on a clean
+			// reference picture rather than waiting for the next IDR interval.
+			registry.requestIDR(name)
+		}
+
+		// SRT → appsrc goroutine. sync.Once prevents double-close when
+		// ctx.Done() and a Recv error race against each other.
+		recvDone := make(chan struct{})
+		var closeOnce sync.Once
+		closeConn := func() { closeOnce.Do(func() { conn.Close() }) }
+
+		go func() {
+			defer close(recvDone)
+			defer closeConn()
+			for {
+				data, recvErr := conn.Recv()
+				if recvErr != nil || data == nil {
+					recv.EndOfStream()
+					return
+				}
+				if pushErr := recv.Push(data); pushErr != nil {
+					logger.Warn("[stream:%s] Push appsrc: %v", name, pushErr)
+					recv.EndOfStream()
+					return
+				}
 			}
-			if wErr := track.WriteSample(media.Sample{
-				Data:     f.Data,
-				Duration: f.Duration,
-			}, nil); wErr != nil {
-				logger.Warn("[stream:%s] WriteSample : %v", name, wErr)
+		}()
+
+		// Main loop: appsink → LiveKit WriteSample.
+		// A 5 s stats ticker logs non-trivial SRT health metrics.
+		statsTicker := time.NewTicker(5 * time.Second)
+		disconnected := false
+
+	innerLoop:
+		for {
+			select {
+			case <-ctx.Done():
+				closeConn() // unblocks the SRT recv goroutine
+				<-recvDone
+				break innerLoop
+			case f, ok := <-recv.Frames():
+				if !ok {
+					<-recvDone
+					disconnected = true
+					break innerLoop
+				}
+				if wErr := track.WriteSample(media.Sample{
+					Data:     f.Data,
+					Duration: f.Duration,
+				}, nil); wErr != nil {
+					logger.Warn("[stream:%s] WriteSample: %v", name, wErr)
+				}
+			case <-statsTicker.C:
+				if c := registry.get(name); c != nil {
+					loss, rtt, bw := c.Stats()
+					if loss > 0.1 || rtt > 50 {
+						logger.Info("[stream:%s] SRT stats: loss=%.1f%% rtt=%.0fms bw=%.2fMbps",
+							name, loss, rtt, bw)
+					}
+				}
 			}
 		}
-	}
 
-	if pub != nil {
-		_ = room.LocalParticipant.UnpublishTrack(pub.SID())
-		logger.Info("[stream:%s] Track removed from LiveKit", name)
+		statsTicker.Stop()
+		registry.unregister(name)
+		recv.Stop()
+		recv.Free()
+
+		if !disconnected {
+			// ctx cancelled — clean exit, track will be deferred-unpublished.
+			break streamLoop
+		}
+
+		// Connection dropped — keep the track alive and wait for a reconnect.
+		logger.Info("[stream:%s] Connection lost — waiting %.0fs for reconnection...",
+			name, grace.Seconds())
+		select {
+		case newConn := <-reconn:
+			logger.Info("[stream:%s] Reconnected — resuming stream", name)
+			conn = newConn
+			// Continue streamLoop: recreate the GStreamer pipeline for the new connection.
+		case <-time.After(grace):
+			logger.Info("[stream:%s] Grace period expired — unpublishing track", name)
+			break streamLoop
+		case <-ctx.Done():
+			break streamLoop
+		}
 	}
-	recv.Stop()
-	recv.Free()
 }
 
 // runBiTelemetry handles the bidirectional SRT telemetry connection.
