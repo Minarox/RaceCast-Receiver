@@ -36,10 +36,10 @@ func buildVideoPipeline() string {
 
 // buildAudioPipeline receives raw Opus frames injected via appsrc.
 // SRT is message-oriented: each srt_recvmsg = one buffer = one Opus frame.
+// No intermediate queue needed: appsink handles back-pressure with drop=true.
 func buildAudioPipeline() string {
 	return `appsrc name=src caps="audio/x-opus,rate=48000,channels=2" ` +
 		`format=bytes is-live=true ! ` +
-		`queue max-size-buffers=16 leaky=downstream ! ` +
 		`appsink name=sink max-buffers=16 drop=true sync=false`
 }
 
@@ -122,9 +122,18 @@ func (r *connRegistry) requestIDR(name string) {
 
 // streamSlot tracks an active stream goroutine. The Accept loop sends reconnect
 // connections into reconn so runStream can resume without destroying the
-// LiveKit track.
+// LiveKit track. closeNow is closed when the emitter signals an intentional
+// stream close, bypassing the reconnect grace period.
 type streamSlot struct {
-	reconn chan *SRTConn // buffered(1)
+	reconn    chan *SRTConn // buffered(1)
+	closeNow  chan struct{}
+	closeOnce sync.Once
+}
+
+// signalClose closes closeNow exactly once, causing the associated runStream
+// goroutine to exit the grace period immediately and unpublish its LiveKit track.
+func (sl *streamSlot) signalClose() {
+	sl.closeOnce.Do(func() { close(sl.closeNow) })
 }
 
 // reconnGraceTimeout is how long runStream keeps the LiveKit track alive and
@@ -251,7 +260,14 @@ func RunStreams(ctx context.Context, cfg config.Config, room *lksdk.Room, wg *sy
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
-					runBiTelemetry(ctx, conn, cfg, meta, registry)
+					runBiTelemetry(ctx, conn, cfg, meta, registry, func(n string) {
+						slotsMu.Lock()
+						sl := slots[n]
+						slotsMu.Unlock()
+						if sl != nil {
+							sl.signalClose()
+						}
+					})
 				}()
 				continue
 			}
@@ -273,7 +289,7 @@ func RunStreams(ctx context.Context, cfg config.Config, room *lksdk.Room, wg *sy
 				}
 				continue
 			}
-			sl = &streamSlot{reconn: make(chan *SRTConn, 1)}
+			sl = &streamSlot{reconn: make(chan *SRTConn, 1), closeNow: make(chan struct{})}
 			slots[name] = sl
 			slotsMu.Unlock()
 
@@ -285,7 +301,7 @@ func RunStreams(ctx context.Context, cfg config.Config, room *lksdk.Room, wg *sy
 					delete(slots, n)
 					slotsMu.Unlock()
 				}()
-				runStream(ctx, c, sl.reconn, n, s, mt, room, registry)
+				runStream(ctx, c, sl.reconn, sl.closeNow, n, s, mt, room, registry)
 			}(name, source, mediaType, sl, conn)
 		}
 	}()
@@ -295,7 +311,7 @@ func RunStreams(ctx context.Context, cfg config.Config, room *lksdk.Room, wg *sy
 // It publishes one LiveKit track (once) and loops: receive SRT data → push to
 // GStreamer → send frames to LiveKit. On SRT disconnection, it waits up to
 // reconnGraceTimeout() for the emitter to reconnect before unpublishing.
-func runStream(ctx context.Context, firstConn *SRTConn, reconn <-chan *SRTConn,
+func runStream(ctx context.Context, firstConn *SRTConn, reconn <-chan *SRTConn, closeNow <-chan struct{},
 	name, source, mediaType string, room *lksdk.Room, registry *connRegistry) {
 
 	var pipelineStr string
@@ -432,6 +448,9 @@ streamLoop:
 			logger.Info("[stream:%s] Reconnected — resuming stream", name)
 			conn = newConn
 			// Continue streamLoop: recreate the GStreamer pipeline for the new connection.
+		case <-closeNow:
+			logger.Info("[stream:%s] Closed by emitter — unpublishing track immediately", name)
+			break streamLoop
 		case <-time.After(grace):
 			logger.Info("[stream:%s] Grace period expired — unpublishing track", name)
 			break streamLoop
@@ -445,7 +464,8 @@ streamLoop:
 // Incoming: typed envelopes routed by "type" ("ups"/"modem" → LiveKit metadata).
 // Flush: leading-edge throttle, 1 s cooldown.
 // Outgoing: IDR requests via registry.requestIDR on GstReceiver decode-warning.
-func runBiTelemetry(ctx context.Context, conn *SRTConn, cfg config.Config, meta *roomMeta, registry *connRegistry) {
+func runBiTelemetry(ctx context.Context, conn *SRTConn, cfg config.Config, meta *roomMeta,
+	registry *connRegistry, signalClose func(name string)) {
 	registry.setTelemConn(conn)
 	defer registry.clearTelemConn()
 	defer conn.Close()
@@ -494,8 +514,9 @@ func runBiTelemetry(ctx context.Context, conn *SRTConn, cfg config.Config, meta 
 		}
 
 		var envelope struct {
-			Type string          `json:"type"`
-			Data json.RawMessage `json:"data"`
+			Type   string          `json:"type"`
+			Stream string          `json:"stream,omitempty"`
+			Data   json.RawMessage `json:"data,omitempty"`
 		}
 		if err := json.Unmarshal(data, &envelope); err != nil || envelope.Type == "" {
 			logger.Warn("[telemetry] Unrecognised message ignored")
@@ -505,6 +526,11 @@ func runBiTelemetry(ctx context.Context, conn *SRTConn, cfg config.Config, meta 
 		switch envelope.Type {
 		case "ups", "modem":
 			meta.update(envelope.Type, envelope.Data)
+		case "stream_close":
+			if envelope.Stream != "" {
+				logger.Info("[telemetry] Stream close signal received for %q", envelope.Stream)
+				signalClose(envelope.Stream)
+			}
 		default:
 			logger.Warn("[telemetry] Unknown message type %q", envelope.Type)
 		}

@@ -103,8 +103,11 @@ import (
 	"unsafe"
 )
 
-// recvBufSize is the max SRT message size (~10 KB, well above one AV1/Opus frame).
-const recvBufSize = 1500 * 7
+// recvBufSize is the max SRT message size. 32 KB covers AV1 IDR frames at ≤ 1 Mbps
+// (IDR frames are typically 5–15× the average P-frame; without intra-refresh they
+// can reach ~40 KB). SRT truncates silently when the buffer is too small, which
+// would corrupt the bitstream. Opus frames are always < 4 KB.
+const recvBufSize = 1 << 15 // 32 KB
 
 // SRTListener wraps an SRT socket in listener mode (single port, N connections).
 type SRTListener struct {
